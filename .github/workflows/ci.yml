@@ -57,7 +57,7 @@ jobs:
         run: scripts/build-macos.sh
       - name: Screenshots with demo data
         if: success()
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: |
           APP="$PWD/macos/build/DerivedData/Build/Products/Release/MailboxAI.app"
           mkdir -p /tmp/shots
@@ -89,6 +89,12 @@ jobs:
           open "mailboxai://pending"
           sleep 5
           screencapture -x /tmp/shots/10-pending.png || true
+          open "mailboxai://settings?tab=ai_features&pane=mcp"
+          sleep 5
+          screencapture -x /tmp/shots/11-ai-mcp.png || true
+          open "mailboxai://settings?tab=ai_features&pane=usage"
+          sleep 5
+          screencapture -x /tmp/shots/12-ai-usage.png || true
           # Last: the add-account sheet stays open on the main window.
           open "mailboxai://add-account"
           sleep 5
