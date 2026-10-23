@@ -103,6 +103,7 @@ pub struct AiSettings {
 |---|---|---|---|---|
 | `claude_code` | Claude Code（订阅） | claude_code | "" | 否 |
 | `codex` | Codex（ChatGPT 订阅） | codex | "" | 否 |
+| `apple` | Apple 端侧模型 | openai | http://127.0.0.1:47922/v1（助手 App 内的 FoundationModels 服务，macOS 26+） | 否 |
 | `openai` | OpenAI | openai | https://api.openai.com/v1 | 是 |
 | `anthropic` | Anthropic Claude | anthropic | https://api.anthropic.com | 是 |
 | `gemini` | Google Gemini | gemini | https://generativelanguage.googleapis.com | 是 |

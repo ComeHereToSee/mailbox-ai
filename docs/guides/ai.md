@@ -50,6 +50,11 @@
   1. 安装 Ollama 后，在终端执行 `ollama pull qwen2.5:7b`（或其他模型）。
   2. 在「Ollama」里点「拉取模型」并勾选。
 - **LM Studio**：在 LM Studio 中打开 Local Server，然后在「LM Studio」里拉取模型。
+- **Apple 端侧模型**：
+  - 需要 macOS 26 和支持 Apple Intelligence 的 Mac，并在 系统设置 → Apple Intelligence 与 Siri 中打开 Apple Intelligence。
+  - 在「Apple 端侧模型」里打开开关即可，页面上会显示是否可用。
+  - 模型由 Mailbox AI 助手在本机提供（127.0.0.1:47922），免费且不联网。
+  - 上下文较短，适合摘要、分类和短邮件改写；长邮件会被截断。
 
 ## 2. 选择模型
 
@@ -196,7 +201,7 @@ AI 会先在本地搜索相关邮件，再根据邮件内容回答。回答中�
 - 只有你主动使用 AI 功能，或开启了智能提醒、自动回复、Loop 时，才会把相关邮件发给所选的 AI 服务。
 - 每次发送的正文有长度上限，默认 12000 字，可以在设置中调整。
 - 加密邮件默认不交给 AI。
-- 想完全不把邮件发到外部，请使用 Ollama 或 LM Studio 本地模型。
+- 想完全不把邮件发到外部，请使用 Apple 端侧模型、Ollama 或 LM Studio。
 
 ## 11. MCP：让 Claude Code / Codex 直接操作邮箱
 

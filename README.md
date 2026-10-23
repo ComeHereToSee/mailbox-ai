@@ -17,7 +17,7 @@
 ## AI 功能
 
 - **AI 服务接入（参考 Cherry Studio）**：
-  - 内置 22 个服务商：OpenAI、Anthropic、Gemini、DeepSeek、通义千问（阿里云百炼）、Kimi、智谱 GLM、硅基流动、豆包、腾讯混元、百度千帆、MiniMax、阶跃星辰、OpenRouter、Groq、Mistral、xAI、Azure OpenAI，以及本地的 Ollama 和 LM Studio。
+  - 内置 22 个服务商：OpenAI、Anthropic、Gemini、DeepSeek、通义千问（阿里云百炼）、Kimi、智谱 GLM、硅基流动、豆包、腾讯混元、百度千帆、MiniMax、阶跃星辰、OpenRouter、Groq、Mistral、xAI、Azure OpenAI，以及本地的 Ollama、LM Studio 和 Apple 端侧模型（macOS 26 的 Apple Intelligence，免费、不联网）。
   - 每个服务商可以填 API Key（可以填多个，轮流使用）和 API 地址，可以拉取或手动添加模型，可以检查连接；也可以添加任意 OpenAI 兼容的自定义服务商。
   - 模型带能力标签（看图、推理、工具、嵌入），还可以单独指定看图模型和向量嵌入模型。
   - 写作和对话用「默认模型」，摘要、分类、提醒等后台任务用便宜的「快速模型」。
@@ -57,7 +57,7 @@
   - 每次只发送需要处理的邮件，正文有长度上限。
   - 加密邮件默认不交给 AI。
   - 每个账户可以单独关闭 AI，或者只允许本地模型处理。
-  - 想完全不出本机，可以用 Ollama 或 LM Studio。
+  - 想完全不出本机，可以用 Apple 端侧模型、Ollama 或 LM Studio。
 
 详细用法见 [AI 使用说明](docs/guides/ai.md)；接口见 [docs/AI.md](docs/AI.md)。
 
