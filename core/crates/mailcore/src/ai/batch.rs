@@ -4,7 +4,7 @@
 use super::model::{BatchItem, BatchJob, ModelRef, SuggestedAction};
 use super::{clean_output, prompts};
 use crate::Engine;
-use crate::engine::Action;
+use crate::engine::{Action, UnsubscribeResult};
 use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::model::{Category, MessageId};
@@ -13,7 +13,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-pub const OPS: &[&str] = &["summarize", "classify", "todos", "draft_replies", "custom"];
+pub const OPS: &[&str] = &["summarize", "classify", "todos", "draft_replies", "custom", "unsubscribe"];
 const MAX_JOBS: usize = 20;
 const MAX_ITEMS: usize = 200;
 const CONCURRENCY: usize = 3;
@@ -72,6 +72,27 @@ pub fn classify_suggestions(v: &Value, current: Category) -> (String, Vec<Sugges
     (line, out)
 }
 
+/// Overall result of a batch unsubscribe (no AI).
+pub fn unsubscribe_summary(items: &[BatchItem]) -> String {
+    let done = items.iter().filter(|i| i.error.is_none() && i.output == UNSUBSCRIBED).count();
+    let open: Vec<&BatchItem> = items.iter().filter(|i| i.error.is_none() && i.output != UNSUBSCRIBED).collect();
+    let failed = items.iter().filter(|i| i.error.is_some()).count();
+    let mut s = format!("已退订 {done} 封");
+    if !open.is_empty() {
+        s.push_str(&format!("，{} 封需要在浏览器中打开退订页面", open.len()));
+    }
+    if failed > 0 {
+        s.push_str(&format!("，{failed} 封没有退订信息或退订失败"));
+    }
+    s.push('。');
+    for i in open {
+        s.push_str(&format!("\n- {} · {}：{}", i.from, i.subject, i.output));
+    }
+    s
+}
+
+const UNSUBSCRIBED: &str = "已退订";
+
 impl Engine {
     /// Starts a job and returns its id; progress arrives as `ai_job` events.
     pub fn ai_start_batch(&self, ids: Vec<MessageId>, op: &str, instruction: Option<String>) -> Result<String> {
@@ -86,7 +107,8 @@ impl Engine {
         if ids.is_empty() {
             return Err(Error::Invalid("请先选择邮件".into()));
         }
-        let model = self.ai_model(true)?;
+        // Unsubscribing does not use a model.
+        let model = if op == "unsubscribe" { ModelRef::default() } else { self.ai_model(true)? };
         let mut items: Vec<BatchItem> = Vec::new();
         for id in ids {
             if items.len() >= MAX_ITEMS {
@@ -205,6 +227,9 @@ impl Engine {
         let items: Vec<BatchItem> = self.ai_job(&job_id).map(|j| j.items).unwrap_or_default();
         let all_failed = !items.is_empty() && items.iter().all(|i| i.error.is_some());
         let mut summary: Option<String> = None;
+        if !cancelled && op == "unsubscribe" {
+            summary = Some(unsubscribe_summary(&items));
+        }
         if !cancelled && !all_failed {
             match op.as_str() {
                 "summarize" | "todos" | "custom" => {
@@ -239,25 +264,33 @@ impl Engine {
     }
 
     async fn ai_batch_item(&self, id: MessageId, op: &str, instruction: &str, model: &ModelRef) -> Result<ItemOutput> {
+        if op == "unsubscribe" {
+            let output = match self.unsubscribe(id).await? {
+                UnsubscribeResult::Done { .. } => UNSUBSCRIBED.to_string(),
+                UnsubscribeResult::OpenUrl { url } => format!("需要在浏览器中打开：{url}"),
+            };
+            return Ok(ItemOutput { output, ..Default::default() });
+        }
         let s = self.ai_settings();
+        let local = self.ai_model_is_local(model);
         match op {
             "classify" => {
-                let mail = self.ai_mail_text(id, s.max_body_chars.min(6000), true).await?;
+                let mail = self.ai_mail_text(id, s.max_body_chars.min(6000), true, local).await?;
                 let current = self.db.message(id)?.summary.category;
                 let (system, user) = prompts::classify(&s, &mail);
-                let v = self.ai_json(model, system, user).await?;
+                let v = self.ai_json(model, "batch", system, user).await?;
                 let (output, suggested) = classify_suggestions(&v, current);
                 Ok(ItemOutput { output, suggested, draft_id: None })
             }
             "draft_replies" => {
-                let text = self.ai_reply_text(id, instruction, model, None).await?;
+                let text = self.ai_reply_text(id, instruction, model, "batch", None).await?;
                 let draft = self.ai_save_reply_draft(id, &text).await?;
                 Ok(ItemOutput { output: text, suggested: Vec::new(), draft_id: Some(draft.id) })
             }
             _ => {
-                let mail = self.ai_mail_text(id, s.max_body_chars.min(6000), true).await?;
+                let mail = self.ai_mail_text(id, s.max_body_chars.min(6000), true, local).await?;
                 let (system, user) = prompts::batch_item(op, instruction, &s, &mail);
-                let text = self.ai_complete(model, system, user, false, None).await?;
+                let text = self.ai_complete(model, "batch", system, user, false, None).await?;
                 Ok(ItemOutput { output: clean_output(&text), ..Default::default() })
             }
         }
@@ -276,7 +309,7 @@ impl Engine {
             return Ok(String::new());
         }
         let (system, user) = prompts::batch_summary(&s, op, instruction, &list);
-        let text = self.ai_complete(model, system, user, false, None).await?;
+        let text = self.ai_complete(model, "batch", system, user, false, None).await?;
         Ok(clean_output(&text))
     }
 
@@ -343,5 +376,19 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"label":"工作","category":"primary","action":"keep"}"#).unwrap();
         let (_, s) = classify_suggestions(&v, Category::Primary);
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_overview() {
+        let item = |output: &str, error: Option<&str>| BatchItem {
+            subject: "周报".into(),
+            from: "店铺".into(),
+            output: output.into(),
+            error: error.map(String::from),
+            ..Default::default()
+        };
+        let s = unsubscribe_summary(&[item("已退订", None), item("需要在浏览器中打开：https://x.cn/u", None), item("", Some("没有退订信息"))]);
+        assert!(s.starts_with("已退订 1 封，1 封需要在浏览器中打开退订页面，1 封没有退订信息或退订失败。"), "{s}");
+        assert!(s.contains("https://x.cn/u"));
     }
 }

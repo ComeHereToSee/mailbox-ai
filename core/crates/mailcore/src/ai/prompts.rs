@@ -11,6 +11,9 @@ pub const ASSISTANT: &str = "你是 Mailbox AI，内置在邮件客户端里的�
 
 const JSON_ONLY: &str = "只输出一个 JSON 对象，不要输出任何其他文字，不要使用 ``` 代码块。";
 
+/// The fields of one calendar entry (smart analysis and calendar extraction).
+const EVENT_FIELDS: &str = "每个日程包含：title（简短的标题，如「西山爬山」）、start（开始时间，格式 \"YYYY-MM-DD HH:MM\"，本地时间；全天的日程写 \"YYYY-MM-DD\"）、end（结束时间，格式同 start，不知道就写 null）、all_day（是否全天，布尔值）、location（地点，没有就写 null）、notes（一句话说明）、source_text（原文中关于时间的说法，如「下周二下午 3 点」）。「明天」「下周二」等相对说法按邮件的发送时间换算；只提取有具体日期的日程，截止期限不算日程。";
+
 pub fn lang_name(code: &str) -> String {
     let name = match code.trim() {
         "zh-CN" | "zh" | "zh-Hans" | "zh_CN" => "简体中文",
@@ -172,7 +175,10 @@ pub fn translate(target_lang: &str, mail: &MailText) -> (String, String) {
 
 /// Smart analysis of a new message (JSON).
 pub fn insight(s: &AiSettings, mail: &MailText) -> (String, String) {
-    let system = format!("{BASE}\n你负责分析新邮件，帮用户判断是否需要回复、有没有截止时间和待办事项。{}\n{JSON_ONLY}", now_context());
+    let system = format!(
+        "{BASE}\n你负责分析新邮件，帮用户判断是否需要回复、有没有截止时间、待办事项和日程，以及是不是钓鱼或诈骗邮件。{}\n{JSON_ONLY}",
+        now_context()
+    );
     let user = format!(
         "分析下面这封邮件（收件人是用户本人），输出一个 JSON 对象，字段如下：\n\
 - needs_reply：布尔值。发件人是否在等用户本人回复或确认；通知、营销、系统自动发送的邮件为 false。\n\
@@ -181,12 +187,71 @@ pub fn insight(s: &AiSettings, mail: &MailText) -> (String, String) {
 - deadline_text：原文里关于截止时间的说法（如「周五前」），没有就写 null。\n\
 - todos：字符串数组，用户需要做的事，每条一句话；没有就写 []。\n\
 - one_line：不超过 40 个字的一句话摘要。\n\
-todos 和 one_line：{}\n\n\
-示例：{{\"needs_reply\":true,\"priority\":\"high\",\"deadline\":\"2026-10-23 18:00\",\"deadline_text\":\"周五前\",\"todos\":[\"确认负责的事项\"],\"one_line\":\"评审会纪要，需周五前确认分工\"}}\n\n\
+- events：数组，邮件里提到的会议、约会、活动等日程，没有就写 []。{EVENT_FIELDS}\n\
+- risk：疑似钓鱼（骗取账号、密码、验证码）写 \"phishing\"，疑似诈骗（骗钱、要求转账付款）写 \"scam\"，没有风险写 null。判断依据：冒充银行、平台、快递、公司领导或熟人；索要密码、验证码、银行卡号，或者要求转账、付款、充值；用「账号将被冻结」「立即验证」之类的说法制造紧迫感；链接或发件人域名与声称的机构不符。正常的通知和营销邮件不算。\n\
+- risk_reason：有风险时用一句话说明理由，没有风险写 \"\"。\n\
+todos、one_line、events 的 title 和 notes、risk_reason：{}\n\n\
+示例：{{\"needs_reply\":true,\"priority\":\"high\",\"deadline\":\"2026-10-23 18:00\",\"deadline_text\":\"周五前\",\"todos\":[\"确认负责的事项\"],\"one_line\":\"评审会纪要，需周五前确认分工\",\"events\":[],\"risk\":null,\"risk_reason\":\"\"}}\n\n\
 邮件：\n{}",
         output_language(s),
         mail_block(mail)
     );
+    (system, user)
+}
+
+/// Calendar extraction (JSON `{"events":[…]}`).
+pub fn events(s: &AiSettings, mail: &MailText) -> (String, String) {
+    let system = format!("{BASE}\n你负责从邮件里找出日程（会议、约会、活动、航班、预约等），方便用户加入日历。{}\n{JSON_ONLY}", now_context());
+    let user = format!(
+        "从下面这封邮件里提取日程，输出 JSON：{{\"events\":[…]}}，没有日程就输出 {{\"events\":[]}}。\n{EVENT_FIELDS}\ntitle 和 notes：{}\n\n\
+示例：{{\"events\":[{{\"title\":\"项目评审会\",\"start\":\"2026-10-27 15:00\",\"end\":\"2026-10-27 16:00\",\"all_day\":false,\"location\":\"3 楼会议室\",\"notes\":\"讨论 Q4 规划\",\"source_text\":\"下周二下午 3 点\"}}]}}\n\n\
+邮件：\n{}",
+        output_language(s),
+        mail_block(mail)
+    );
+    (system, user)
+}
+
+/// Whether an own sent message waits for an answer (JSON `{"awaits_reply","reason"}`).
+pub fn followup(s: &AiSettings, mail: &MailText, days: i64) -> (String, String) {
+    let system = format!("{BASE}\n你帮用户判断自己发出的邮件是否在等对方回复。{JSON_ONLY}");
+    let user = format!(
+        "下面是用户本人 {days} 天前发出的一封邮件，之后一直没有收到对方的回复。判断这封邮件是否在等对方回复：提出了问题或请求、需要对方确认、答复或提供材料的算；只是通知、感谢、回复确认、群发的不算。\n\
+输出 JSON：{{\"awaits_reply\": true 或 false, \"reason\": \"一句话理由\"}}。reason：{}\n\n邮件：\n{}",
+        output_language(s),
+        mail_block(mail)
+    );
+    (system, user)
+}
+
+/// One subject line for a body (`/compose` op `subject`).
+pub fn subject(text: &str) -> (String, String) {
+    let system = format!("{BASE}\n你是用户的邮件写作助手。");
+    let user = format!(
+        "为下面这段邮件正文拟一个邮件主题：只有一行，不超过 30 个字，准确说明邮件的目的；使用与正文相同的语言；不要加引号、书名号或「主题：」前缀，只输出主题本身。\n\n正文：\n\"\"\"\n{text}\n\"\"\""
+    );
+    (system, user)
+}
+
+/// Explaining an attachment: `content` is its text (None for an image sent alongside).
+pub fn explain(s: &AiSettings, filename: &str, content: Option<&str>, question: Option<&str>) -> (String, String) {
+    let system = format!("{BASE}\n你帮用户解读邮件附件。{}\n{}", output_language(s), now_context());
+    let task = match question.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => format!("根据这份附件回答我的问题：{q}\n附件里找不到答案时直接说明。"),
+        None => "概括这份附件的内容和关键信息，列出需要我注意或处理的事项。可以使用 Markdown 列表。".to_string(),
+    };
+    let body = match content {
+        Some(c) => format!("附件内容：\n\"\"\"\n{c}\n\"\"\""),
+        None => "附件是一张图片，见下方。".to_string(),
+    };
+    (system, format!("{task}\n\n附件：{filename}\n{body}"))
+}
+
+/// A prompt of the user's library run on a message or conversation (reader).
+pub fn reader_prompt(s: &AiSettings, prompt: &str, conversation: &str, thread: bool) -> (String, String) {
+    let system = format!("{BASE}\n你帮用户处理邮件。{}\n{}", output_language(s), now_context());
+    let what = if thread { "下面是一个邮件会话（按时间顺序）。" } else { "下面是一封邮件。" };
+    let user = format!("{what}请按我的要求处理：{prompt}\n只根据邮件内容回答，不要编造。可以使用 Markdown。\n\n{conversation}");
     (system, user)
 }
 
@@ -284,7 +349,15 @@ mod tests {
         assert!(rewrite("unknown", "x", "", "").is_none());
         let (_, user) = rewrite("translate", "你好", "", "ja").unwrap();
         assert!(user.contains("日本語") && user.contains("你好"));
-        let (system, _) = insight(&s, &MailText::default());
+        let (system, user) = insight(&s, &MailText::default());
         assert!(system.contains("时区"));
+        assert!(user.contains("risk") && user.contains("events") && user.contains("source_text"));
+        let (_, user) = events(&s, &MailText::default());
+        assert!(user.contains("source_text") && !user.contains("needs_reply"));
+        let (_, user) = followup(&s, &MailText::default(), 4);
+        assert!(user.contains("awaits_reply") && user.contains("4 天前"));
+        assert!(subject("正文").1.contains("30 个字"));
+        assert!(explain(&s, "a.pdf", Some("内容"), Some("多少钱？")).1.contains("多少钱？"));
+        assert!(explain(&s, "a.png", None, None).1.contains("图片"));
     }
 }

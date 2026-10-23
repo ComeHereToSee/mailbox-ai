@@ -60,7 +60,8 @@ impl Engine {
         }
         let s = self.ai_settings();
         let model = self.ai_model(true)?;
-        let conversation = self.ai_conversation(id, thread, s.max_body_chars).await?;
+        let local = self.ai_model_is_local(&model);
+        let conversation = self.ai_conversation(id, thread, s.max_body_chars, local).await?;
         let (system, user) = prompts::summary(&s, &conversation, thread);
         let thread_count = self.ai_thread_count(id, thread)?;
         Ok(SummaryPlan::Generate { model, system, user, thread_count })
@@ -76,7 +77,7 @@ impl Engine {
                 Ok(StreamDone::new(c.text, c.model).with("cached", json!(true)))
             }
             SummaryPlan::Generate { model, system, user, thread_count } => {
-                let raw = self.ai_complete(&model, system, user, false, tx).await?;
+                let raw = self.ai_complete(&model, "summary", system, user, false, tx).await?;
                 let text = clean_output(&raw);
                 let c = SummaryCache { text: text.clone(), model: model.label(), created_at: now(), thread_count };
                 self.ai_store_summary(id, thread, &c)?;
@@ -91,14 +92,15 @@ impl Engine {
             if s.language.trim().is_empty() || s.language == "auto" { "zh-CN".to_string() } else { s.language.clone() }
         });
         let model = self.ai_model(true)?;
-        let mail = self.ai_mail_text(id, s.max_body_chars, false).await?;
+        let local = self.ai_model_is_local(&model);
+        let mail = self.ai_mail_text(id, s.max_body_chars, false, local).await?;
         let (system, user) = prompts::translate(&target, &mail);
         Ok(TranslatePlan { target_lang: target, model, system, user })
     }
 
     pub async fn ai_translate_run(&self, plan: TranslatePlan, tx: DeltaTx) -> Result<StreamDone> {
         let label = plan.model.label();
-        let raw = self.ai_complete(&plan.model, plan.system, plan.user, false, tx).await?;
+        let raw = self.ai_complete(&plan.model, "summary", plan.system, plan.user, false, tx).await?;
         Ok(StreamDone::new(clean_output(&raw), label).with("target_lang", json!(plan.target_lang)))
     }
 
@@ -106,9 +108,10 @@ impl Engine {
     pub async fn ai_replies(&self, id: MessageId) -> Result<Vec<ReplySuggestion>> {
         let s = self.ai_settings();
         let model = self.ai_model(false)?;
-        let conversation = self.ai_conversation(id, true, s.max_body_chars).await?;
+        let local = self.ai_model_is_local(&model);
+        let conversation = self.ai_conversation(id, true, s.max_body_chars, local).await?;
         let (system, user) = prompts::replies(&s, &conversation);
-        let v = self.ai_json(&model, system, user).await?;
+        let v = self.ai_json(&model, "compose", system, user).await?;
         let mut out = Vec::new();
         for item in v["suggestions"].as_array().into_iter().flatten() {
             let text = item["text"].as_str().unwrap_or("").trim().to_string();

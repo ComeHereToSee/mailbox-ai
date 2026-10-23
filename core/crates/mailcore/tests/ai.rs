@@ -1,7 +1,8 @@
 //! AI features against fake providers, no network and no real models:
 //! - an OpenAI compatible and an Anthropic server (axum on 127.0.0.1:0) answering with SSE
-//!   split into small chunks,
-//! - fake `claude` / `codex` shell scripts selected through the provider's `base_url`.
+//!   split into small chunks, plus routes for key rotation and tool calls,
+//! - fake `claude` / `codex` shell scripts selected through the provider's `base_url`,
+//! - fake MCP servers: a python3 stdio script and an axum Streamable HTTP server.
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -48,6 +49,12 @@ fn fake_answer(prompt: &str) -> String {
     if prompt.contains("needs_reply") {
         json!({"needs_reply": true, "priority": "high", "deadline": "2099-01-02 18:00", "deadline_text": "下周五前",
                "todos": ["确认分工"], "one_line": "测试一句话"})
+        .to_string()
+    } else if prompt.contains("awaits_reply") {
+        json!({"awaits_reply": true, "reason": "在等对方确认报价"}).to_string()
+    } else if prompt.contains("source_text") {
+        json!({"events": [{"title": "西山爬山", "start": "2099-06-06 08:00", "end": null, "all_day": false,
+                           "location": "西山门口", "notes": "记得带水", "source_text": "周六早上 8 点"}]})
         .to_string()
     } else if prompt.contains("\"queries\"") {
         "```json\n{\"queries\": [\"纪要\"]}\n```".to_string()
@@ -103,8 +110,49 @@ fn openai_stream(v: &Value) -> Response {
     for p in pieces(&fake_answer(&prompt_text(v))) {
         s.push_str(&format!("data: {}\r\n\r\n", json!({"choices": [{"index": 0, "delta": {"content": p}}]})));
     }
+    if v["stream_options"]["include_usage"] == true {
+        s.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n");
+    }
     s.push_str("data: [DONE]\n\n");
     sse(chunked(&s, 7))
+}
+
+/// Rejects the key "key-a" (401), accepts any other.
+async fn keyed_chat(State(f): State<Fake>, headers: HeaderMap, body: Bytes) -> Response {
+    let v = record(&f, &headers, &body, "authorization");
+    if headers.get("authorization").and_then(|h| h.to_str().ok()) == Some("Bearer key-a") {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "invalid key"}}))).into_response();
+    }
+    openai_stream(&v)
+}
+
+/// A model that calls the first tool named `*__echo`, then answers with the tool result.
+async fn tools_chat(State(f): State<Fake>, headers: HeaderMap, body: Bytes) -> Response {
+    let v = record(&f, &headers, &body, "authorization");
+    let messages = v["messages"].as_array().cloned().unwrap_or_default();
+    if let Some(result) = messages.iter().find(|m| m["role"] == "tool") {
+        let content = result["content"].as_str().unwrap_or("");
+        return axum::Json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("工具说：{content}")}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 5}
+        }))
+        .into_response();
+    }
+    let name = v["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .find(|n| n.ends_with("__echo"))
+        .unwrap_or("missing")
+        .to_string();
+    axum::Json(json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": name, "arguments": "{\"text\":\"你好\"}"}}
+        ]}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 6}
+    }))
+    .into_response()
 }
 
 async fn openai_chat(State(f): State<Fake>, headers: HeaderMap, body: Bytes) -> Response {
@@ -159,6 +207,8 @@ async fn start_fake() -> (String, Fake) {
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/models", get(openai_models))
         .route("/strict/v1/chat/completions", post(strict_chat))
+        .route("/keys/v1/chat/completions", post(keyed_chat))
+        .route("/tools/v1/chat/completions", post(tools_chat))
         .route("/anthropic/v1/messages", post(anthropic_messages))
         .route("/anthropic/v1/models", get(anthropic_models))
         .with_state(fake.clone());
@@ -796,4 +846,811 @@ printf '%s' 'Codex 最终回复' > "$out"
     let status = c.get("/v1/ai/cli").await;
     assert_eq!(status["codex"]["found"], false);
     let _ = std::fs::remove_dir_all(&bin);
+}
+
+// ---- second batch (docs/AI.md §8) ---------------------------------------------------------
+
+/// The id of a message's first attachment whose MIME type starts with `prefix`.
+async fn attachment_id(c: &Ctx, message: i64, prefix: &str) -> i64 {
+    let detail = c.get(&format!("/v1/messages/{message}")).await;
+    detail["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["mime_type"].as_str().unwrap_or("").starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix} attachment: {detail}"))["id"]
+        .as_i64()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calendar_attachments_prompts_and_policies() {
+    let (fake_base, fake) = start_fake().await;
+    let c = setup(true).await;
+    use_fakes(&c, &fake_base).await;
+
+    // Calendar extraction: the model's JSON becomes events, cached until forced.
+    let hike = message_id(&c, "周末爬山").await;
+    let r = c.post(&format!("/v1/ai/messages/{hike}/events"), json!({})).await;
+    assert_eq!(r["cached"], false, "{r}");
+    let events = r["events"].as_array().unwrap().clone();
+    assert_eq!(events.len(), 1, "{r}");
+    assert_eq!(events[0]["title"], "西山爬山");
+    assert_eq!(events[0]["location"], "西山门口");
+    assert_eq!(events[0]["source_text"], "周六早上 8 点");
+    assert_eq!(events[0]["all_day"], false);
+    assert!(events[0]["start"].as_i64().unwrap() > 4_000_000_000);
+    assert!(events[0]["end"].is_null());
+    let again = c.post(&format!("/v1/ai/messages/{hike}/events"), json!({})).await;
+    assert_eq!(again["cached"], true);
+    assert_eq!(again["events"], json!(events));
+    let forced = c.post(&format!("/v1/ai/messages/{hike}/events"), json!({"force": true})).await;
+    assert_eq!(forced["cached"], false);
+    // The smart analysis fills the same cache; risk is null for ordinary mail.
+    let notes = message_id(&c, "纪要").await;
+    let ins = c.post(&format!("/v1/ai/messages/{notes}/insight"), json!({})).await;
+    assert!(ins["events"].as_array().unwrap().is_empty(), "{ins}");
+    assert!(ins["risk"].is_null(), "{ins}");
+    assert_eq!(ins["risk_reason"], "");
+    let cached = c.post(&format!("/v1/ai/messages/{notes}/events"), json!({})).await;
+    assert_eq!(cached["cached"], true, "{cached}");
+
+    // Compose: a subject for the body.
+    let (_, done) = c.generate("/v1/ai/compose", json!({"op": "subject", "text": "下周二下午三点开评审会，请准时参加。"})).await;
+    assert_eq!(done["subject"], PLAIN_ANSWER);
+    assert_eq!(done["text"], PLAIN_ANSWER);
+    let (status, _) = c.stream("/v1/ai/compose", json!({"op": "subject", "text": " "})).await;
+    assert_eq!(status, 400);
+
+    // Prompt library: defaults on first read, add and delete, run one on a message.
+    let prompts = c.get("/v1/ai/prompts").await;
+    let list = prompts.as_array().unwrap();
+    assert_eq!(list.len(), 5, "{prompts}");
+    assert_eq!(list.iter().filter(|p| p["scope"] == "reader").count(), 2);
+    assert_eq!(list.iter().filter(|p| p["scope"] == "compose").count(), 2);
+    let saved = c.post("/v1/ai/prompts", json!({"name": "", "scope": "batch", "prompt": "列出所有附件"})).await;
+    let pid = saved["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["name"], "列出所有附件");
+    assert_eq!(c.get("/v1/ai/prompts").await.as_array().unwrap().last().unwrap()["id"], pid.as_str());
+    let (status, _) = c.send(reqwest::Method::POST, "/v1/ai/prompts", Some(json!({"scope": "nope", "prompt": "x"}))).await;
+    assert_eq!(status, 400);
+    c.send(reqwest::Method::DELETE, &format!("/v1/ai/prompts/{pid}"), None).await;
+    assert_eq!(c.get("/v1/ai/prompts").await.as_array().unwrap().len(), 5);
+    let (_, done) = c.generate(&format!("/v1/ai/messages/{notes}/prompt"), json!({"prompt": "提取所有金额和日期", "thread": false})).await;
+    assert_eq!(done["text"], PLAIN_ANSWER);
+    let last = fake.requests.lock().unwrap().last().cloned().unwrap();
+    assert!(prompt_text(&last).contains("提取所有金额和日期"));
+
+    // Attachments: a PDF needs the text the app extracted.
+    let pdf = attachment_id(&c, notes, "application/pdf").await;
+    let path = format!("/v1/ai/messages/{notes}/attachments/{pdf}/explain");
+    let (status, lines) = c.stream(&path, json!({})).await;
+    assert_eq!(status, 400, "{lines:?}");
+    let (_, done) = c.generate(&path, json!({"text": "会议纪要：移动端改版由张三负责。", "question": "谁负责移动端？"})).await;
+    assert_eq!(done["text"], PLAIN_ANSWER);
+    assert!(done["filename"].as_str().unwrap().ends_with(".pdf"), "{done}");
+    let last = fake.requests.lock().unwrap().last().cloned().unwrap();
+    let sent = prompt_text(&last);
+    assert!(sent.contains("谁负责移动端？") && sent.contains("移动端改版由张三负责"), "{sent}");
+    // An image needs a model that can see images.
+    let mockups = message_id(&c, "mockups").await;
+    let png = attachment_id(&c, mockups, "image/").await;
+    let path = format!("/v1/ai/messages/{mockups}/attachments/{png}/explain");
+    let (status, lines) = c.stream(&path, json!({})).await;
+    assert_eq!(status, 400, "{lines:?}");
+    assert_eq!(lines[0]["code"], "ai_not_configured");
+    assert!(lines[0]["error"].as_str().unwrap().contains("看图"), "{lines:?}");
+    let mut s = c.get("/v1/ai/settings").await;
+    s["vision_model"] = json!({"provider": "fake", "model": "fake-mini"});
+    c.put("/v1/ai/settings", s).await;
+    let (_, done) = c.generate(&path, json!({"question": "图里是什么？"})).await;
+    assert_eq!(done["text"], PLAIN_ANSWER);
+    let last = fake.requests.lock().unwrap().last().cloned().unwrap();
+    let parts = last["messages"].as_array().unwrap().last().unwrap()["content"].as_array().cloned().expect("content parts");
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,ZGVtbw==");
+
+    // Model capabilities are inferred from the id; key_count is reported.
+    c.put(
+        "/v1/ai/providers/remote",
+        json!({"name": "Remote", "kind": "openai", "base_url": "https://api.remote-demo.invalid/v1", "enabled": true,
+               "models": [{"id": "gpt-4o-mini"}, {"id": "text-embedding-3-small"}], "api_key": "sk-remote"}),
+    )
+    .await;
+    let providers = c.get("/v1/ai/providers").await;
+    let remote = providers.as_array().unwrap().iter().find(|p| p["id"] == "remote").unwrap().clone();
+    assert_eq!(remote["key_count"], 1);
+    assert_eq!(remote["models"][0]["capabilities"], json!(["vision", "tools"]));
+    assert_eq!(remote["models"][1]["capabilities"], json!(["embedding"]));
+    let openai = providers.as_array().unwrap().iter().find(|p| p["id"] == "openai").unwrap().clone();
+    assert_eq!(openai["models"][0]["capabilities"], json!(["vision", "tools"]), "{openai}");
+
+    // Account policies: "off" refuses, "local_only" accepts local models only.
+    let accounts = c.get("/v1/accounts").await;
+    let qq = accounts.as_array().unwrap().iter().find(|a| a["label"] == "QQ·工作").unwrap()["id"].as_str().unwrap().to_string();
+    let mut s = c.get("/v1/ai/settings").await;
+    s["account_policies"][qq.as_str()] = json!("off");
+    s["notify_mode"] = json!("loud");
+    let saved = c.put("/v1/ai/settings", s).await;
+    assert_eq!(saved["notify_mode"], "normal", "unknown modes fall back");
+    assert_eq!(saved["account_policies"][qq.as_str()], "off");
+    let (status, lines) = c.stream(&format!("/v1/ai/messages/{notes}/summary"), json!({"force": true})).await;
+    assert_eq!(status, 400, "{lines:?}");
+    assert_eq!(lines[0]["code"], "ai_refused");
+    assert_eq!(lines[0]["error"], "这个账户已关闭 AI");
+    let (_, done) = c.generate("/v1/ai/ask", json!({"question": "王经理的会议纪要让我做什么？"})).await;
+    assert!(done["sources"].as_array().unwrap().iter().all(|src| src["message_id"] != notes), "{done}");
+    let mut s = c.get("/v1/ai/settings").await;
+    s["account_policies"][qq.as_str()] = json!("local_only");
+    s["quick_model"] = json!({"provider": "remote", "model": "gpt-4o-mini"});
+    c.put("/v1/ai/settings", s).await;
+    let (status, lines) = c.stream(&format!("/v1/ai/messages/{notes}/summary"), json!({"force": true})).await;
+    assert_eq!(status, 400, "{lines:?}");
+    assert_eq!(lines[0]["error"], "这个账户只允许使用本地模型");
+    // The fake server on 127.0.0.1 counts as local.
+    let mut s = c.get("/v1/ai/settings").await;
+    s["quick_model"] = json!({"provider": "fake", "model": "fake-mini"});
+    c.put("/v1/ai/settings", s).await;
+    let (_, done) = c.generate(&format!("/v1/ai/messages/{notes}/summary"), json!({"force": true})).await;
+    assert!(done["text"].as_str().unwrap().contains("一句话"), "{done}");
+
+    // Demo data of the second batch.
+    let demo = c.post("/v1/ai/demo", json!({})).await;
+    let phishing = demo["phishing_message_id"].as_i64().expect("phishing message");
+    let ins = c.get(&format!("/v1/ai/messages/{phishing}/insight")).await;
+    assert_eq!(ins["risk"], "phishing");
+    let events = c.post(&format!("/v1/ai/messages/{}/events", demo["events_message_id"].as_i64().unwrap()), json!({})).await;
+    assert_eq!(events["cached"], true);
+    assert_eq!(events["events"][0]["title"], "西山爬山");
+    let reminders = c.get("/v1/ai/reminders").await;
+    let list = reminders.as_array().unwrap();
+    assert!(list.iter().any(|r| r["kind"] == "follow_up" && r["message"]["id"] == demo["followup_message_id"]), "{reminders}");
+    assert!(list.iter().any(|r| r["message"]["id"] == phishing && r["insight"]["risk"] == "phishing"), "{reminders}");
+    assert_eq!(c.get("/v1/ai/settings").await["mcp_enabled"], true);
+    let servers = c.get("/v1/ai/mcp-servers").await;
+    assert!(servers.as_array().unwrap().iter().any(|s| s["id"] == "demo-filesystem" && s["enabled"] == false));
+    let usage = c.get("/v1/ai/usage?days=7").await;
+    assert_eq!(usage["days"].as_array().unwrap().len(), 7);
+    assert!(usage["days"].as_array().unwrap().iter().all(|d| d["calls"].as_u64().unwrap() > 0), "{usage}");
+    assert!(usage["by_feature"].as_array().unwrap().len() >= 5);
+}
+
+// ---- built-in MCP server ----------------------------------------------------------------
+
+async fn mcp_post(http: &reqwest::Client, base: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+    let mut req = http.post(format!("{base}/mcp")).json(&body);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let r = req.send().await.unwrap();
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    let v = if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::String(text)) };
+    (status, v)
+}
+
+fn rpc(id: i64, method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+fn tool_call(id: i64, name: &str, args: Value) -> Value {
+    rpc(id, "tools/call", json!({"name": name, "arguments": args}))
+}
+
+/// Text of a `tools/call` result.
+fn tool_text(v: &Value) -> String {
+    v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no tool text: {v}")).to_string()
+}
+
+/// The JSON object at the end of a tool text (`… {"draft_id":"…"}`).
+fn trailing_json(text: &str) -> Value {
+    let start = text.find('{').unwrap_or_else(|| panic!("no JSON in {text}"));
+    serde_json::from_str(&text[start..]).unwrap()
+}
+
+/// Calls a tool in the background (it waits for a confirmation).
+fn spawn_tool(c: &Ctx, token: &str, id: i64, name: &str, args: Value) -> tokio::task::JoinHandle<(u16, Value)> {
+    let (http, base, token, body) = (c.http.clone(), c.base.clone(), token.to_string(), tool_call(id, name, args));
+    tokio::spawn(async move { mcp_post(&http, &base, Some(token.as_str()), body).await })
+}
+
+async fn pending_confirmation(c: &Ctx) -> Value {
+    let list = c.wait_for("/v1/ai/confirm", |v| v.as_array().is_some_and(|a| !a.is_empty())).await;
+    list[0].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_server_and_confirmations() {
+    // A short wait for the timeout case; no other test asks for confirmations.
+    unsafe { std::env::set_var("MAILBOX_AI_CONFIRM_TIMEOUT_SECS", "5") };
+    let c = setup(true).await;
+    let info = c.get("/v1/ai/mcp").await;
+    assert_eq!(info["enabled"], false);
+    assert_eq!(info["url"], format!("{}/mcp", c.base), "the real port");
+    assert_eq!(info["stdio_command"], "");
+    let token = info["token"].as_str().unwrap().to_string();
+    assert_eq!(token.len(), 64);
+    assert_eq!(c.get("/v1/ai/mcp").await["token"], token.as_str(), "the token is kept");
+
+    let init = rpc(1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}));
+    // Off: 403 with a JSON-RPC error.
+    let (status, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), init.clone()).await;
+    assert_eq!(status, 403, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("MCP 未启用"), "{v}");
+    let mut s = c.get("/v1/ai/settings").await;
+    s["mcp_enabled"] = json!(true);
+    c.put("/v1/ai/settings", s).await;
+
+    // Tokens: none or a wrong one → 401; the MCP token and the API token both work.
+    assert_eq!(mcp_post(&c.http, &c.base, None, init.clone()).await.0, 401);
+    assert_eq!(mcp_post(&c.http, &c.base, Some("wrong"), init.clone()).await.0, 401);
+    let (status, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), init.clone()).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["jsonrpc"], "2.0");
+    assert_eq!(v["id"], 1);
+    assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(v["result"]["serverInfo"]["name"], "mailbox-ai");
+    assert!(v["result"]["capabilities"]["tools"].is_object());
+    assert!(v["result"]["instructions"].as_str().unwrap().contains("确认"));
+    let (status, v) = mcp_post(&c.http, &c.base, Some(c.token.as_str()), rpc(2, "initialize", json!({"protocolVersion": "1999-01-01"}))).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+    // Notifications: 202 without a body. GET: 405. Unknown method: -32601.
+    let (status, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    assert_eq!((status, v), (202, Value::Null));
+    let get = c.http.get(format!("{}/mcp", c.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(get.status().as_u16(), 405);
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), rpc(3, "resources/list", json!({}))).await;
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), rpc(4, "ping", json!({}))).await;
+    assert_eq!(v["result"], json!({}));
+
+    // tools/list
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), rpc(5, "tools/list", json!({}))).await;
+    let tools = v["result"]["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for n in [
+        "list_accounts", "search_emails", "list_unread", "read_email", "read_thread", "get_pending", "draft_email", "reply_email",
+        "send_email", "mark_emails", "delete_emails",
+    ] {
+        assert!(names.contains(&n), "missing tool {n}");
+    }
+    assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object" && !t["description"].as_str().unwrap().is_empty()));
+
+    // Reading tools.
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(6, "search_emails", json!({"query": "纪要"}))).await;
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let text = tool_text(&v);
+    assert!(text.contains("Q4 产品规划评审会议纪要"), "{text}");
+    let notes = message_id(&c, "纪要").await;
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(7, "read_email", json!({"id": notes}))).await;
+    let text = tool_text(&v);
+    assert!(text.contains("王经理") && text.contains("周五前"), "{text}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(8, "read_thread", json!({"id": notes.to_string()}))).await;
+    assert!(tool_text(&v).contains("这个会话共"), "{v}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(9, "list_accounts", json!({}))).await;
+    assert!(tool_text(&v).contains("me@qq-demo.com"), "{v}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(10, "no_such_tool", json!({}))).await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(11, "read_email", json!({}))).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+
+    // Organising without confirmation.
+    let doc = message_id(&c, "接口文档").await;
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(12, "mark_emails", json!({"ids": [doc], "action": "star"}))).await;
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    assert!(c.engine.db.message(doc).unwrap().summary.flags.flagged);
+    let (_, v) = mcp_post(
+        &c.http,
+        &c.base,
+        Some(token.as_str()),
+        tool_call(13, "draft_email", json!({"to": ["李四 <lisi@corp-demo.cn>"], "subject": "MCP 草稿", "body": "第一段\n\n第二段"})),
+    )
+    .await;
+    let draft_id = trailing_json(&tool_text(&v))["draft_id"].as_str().unwrap().to_string();
+    let draft = c.get(&format!("/v1/drafts/{draft_id}")).await;
+    assert_eq!(draft["subject"], "MCP 草稿");
+    assert!(draft["html"].as_str().unwrap().starts_with("<div>第一段</div>"), "{draft}");
+    assert_eq!(draft["to"][0]["name"], "李四");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(14, "reply_email", json!({"id": doc, "body": "收到，谢谢。"}))).await;
+    let reply_id = trailing_json(&tool_text(&v))["draft_id"].as_str().unwrap().to_string();
+    let reply = c.get(&format!("/v1/drafts/{reply_id}")).await;
+    assert_eq!(reply["source_message_id"], doc);
+    assert!(reply["html"].as_str().unwrap().starts_with("<div>收到，谢谢。</div>"), "{reply}");
+
+    // send_email, approved in Mailbox AI.
+    let mut events = c.engine.events.subscribe();
+    let call = spawn_tool(&c, &token, 15, "send_email", json!({"to": ["lisi@corp-demo.cn"], "subject": "MCP 测试", "body": "你好\n\n这是测试。"}));
+    let conf = pending_confirmation(&c).await;
+    let conf_id = conf["id"].as_str().unwrap().to_string();
+    assert_eq!(conf["kind"], "send");
+    assert!(conf["detail"].as_str().unwrap().contains("lisi@corp-demo.cn"), "{conf}");
+    assert!(conf["title"].as_str().unwrap().contains("MCP 测试"));
+    assert!(conf["draft_id"].as_str().is_some());
+    assert!(conf["expires_at"].as_i64().unwrap() > conf["created_at"].as_i64().unwrap());
+    let mut saw_event = false;
+    while let Ok(ev) = events.try_recv() {
+        if let Event::AiConfirm { id, kind, .. } = ev {
+            saw_event |= id == conf_id && kind == "send";
+        }
+    }
+    assert!(saw_event);
+    c.post(&format!("/v1/ai/confirm/{conf_id}"), json!({"approve": true})).await;
+    let (status, v) = call.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    assert!(tool_text(&v).starts_with("已发送"), "{v}");
+    let outbox = c.get("/v1/outbox").await;
+    assert!(outbox.as_array().unwrap().iter().any(|o| o["subject"] == "MCP 测试"), "{outbox}");
+    let (status, _) = c.send(reqwest::Method::POST, &format!("/v1/ai/confirm/{conf_id}"), Some(json!({"approve": true}))).await;
+    assert_eq!(status, 404, "a decision counts once");
+
+    // send_email nobody answers: times out (MAILBOX_AI_CONFIRM_TIMEOUT_SECS), the draft stays.
+    let started = std::time::Instant::now();
+    let call = spawn_tool(&c, &token, 16, "send_email", json!({"to": "lisi@corp-demo.cn", "subject": "无人确认", "body": "超时测试"}));
+    let conf = pending_confirmation(&c).await;
+    let kept = conf["draft_id"].as_str().unwrap().to_string();
+    let (_, v) = call.await.unwrap();
+    let text = tool_text(&v);
+    assert!(text.contains("等待确认超时") && text.contains(&kept), "{text}");
+    assert_eq!(v["result"]["isError"], false);
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert!(c.get("/v1/ai/confirm").await.as_array().unwrap().is_empty());
+    assert_eq!(c.get(&format!("/v1/drafts/{kept}")).await["subject"], "无人确认");
+
+    // delete_emails: refused, then approved.
+    let call = spawn_tool(&c, &token, 17, "delete_emails", json!({"ids": [doc]}));
+    let conf = pending_confirmation(&c).await;
+    assert_eq!(conf["kind"], "delete");
+    assert_eq!(conf["message_ids"], json!([doc]));
+    c.post(&format!("/v1/ai/confirm/{}", conf["id"].as_str().unwrap()), json!({"approve": false})).await;
+    let (_, v) = call.await.unwrap();
+    assert!(tool_text(&v).contains("拒绝"), "{v}");
+    assert_ne!(c.engine.db.message(doc).unwrap().folder_role, FolderRole::Trash);
+    let call = spawn_tool(&c, &token, 18, "delete_emails", json!({"ids": [doc]}));
+    let conf = pending_confirmation(&c).await;
+    c.post(&format!("/v1/ai/confirm/{}", conf["id"].as_str().unwrap()), json!({"approve": true})).await;
+    let (_, v) = call.await.unwrap();
+    assert!(tool_text(&v).contains("废纸篓"), "{v}");
+    assert_eq!(c.engine.db.message(doc).unwrap().folder_role, FolderRole::Trash);
+
+    // Account policies apply to MCP clients (they count as non-local models).
+    let accounts = c.get("/v1/accounts").await;
+    let qq = accounts.as_array().unwrap().iter().find(|a| a["label"] == "QQ·工作").unwrap()["id"].as_str().unwrap().to_string();
+    let mut s = c.get("/v1/ai/settings").await;
+    s["account_policies"][qq.as_str()] = json!("local_only");
+    c.put("/v1/ai/settings", s).await;
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(19, "read_email", json!({"id": notes}))).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    assert!(tool_text(&v).contains("只允许使用本地模型"), "{v}");
+    let (_, v) = mcp_post(&c.http, &c.base, Some(token.as_str()), tool_call(20, "search_emails", json!({"query": "纪要"}))).await;
+    assert!(!tool_text(&v).contains("Q4 产品规划评审会议纪要"), "{v}");
+
+    // A new token replaces the old one.
+    let fresh = c.post("/v1/ai/mcp/token", json!({})).await["token"].as_str().unwrap().to_string();
+    assert_ne!(fresh, token);
+    assert_eq!(mcp_post(&c.http, &c.base, Some(token.as_str()), rpc(21, "ping", json!({}))).await.0, 401);
+    assert_eq!(mcp_post(&c.http, &c.base, Some(fresh.as_str()), rpc(22, "ping", json!({}))).await.0, 200);
+}
+
+// ---- external MCP servers and the tool loop ---------------------------------------------
+
+#[cfg(unix)]
+const FAKE_STDIO_MCP: &str = r#"#!/usr/bin/env python3
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+sys.stderr.write("fake mcp starting\n")
+while True:
+    raw = sys.stdin.buffer.readline()
+    if not raw:
+        break
+    line = raw.decode("utf-8").strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "fake-stdio", "version": "1"}}
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "listing"}})
+        result = {"tools": [{"name": "echo", "description": "Echo back the text",
+                             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
+    elif method == "tools/call":
+        args = msg["params"].get("arguments") or {}
+        result = {"content": [{"type": "text", "text": "echo: " + str(args.get("text", ""))}], "isError": False}
+    else:
+        send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "not found"}})
+        continue
+    send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+"#;
+
+#[derive(Clone, Default)]
+struct McpFake {
+    sessions: Arc<Mutex<Vec<String>>>,
+}
+
+/// Streamable HTTP MCP server: needs `Authorization: Bearer mcp-secret`, hands out a session
+/// on `initialize` and requires it afterwards, answers `tools/list` as SSE.
+async fn fake_mcp(State(f): State<McpFake>, headers: HeaderMap, body: Bytes) -> Response {
+    if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Bearer mcp-secret") {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(id) = v.get("id").cloned() else { return StatusCode::ACCEPTED.into_response() };
+    let method = v["method"].as_str().unwrap_or("").to_string();
+    if method == "initialize" {
+        let resp = json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "fake-http", "version": "1"}}});
+        return Response::builder()
+            .header("content-type", "application/json")
+            .header("mcp-session-id", "sess-1")
+            .body(Body::from(resp.to_string()))
+            .unwrap();
+    }
+    let session = headers.get("mcp-session-id").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+    f.sessions.lock().unwrap().push(session.clone());
+    if session != "sess-1" {
+        return (StatusCode::BAD_REQUEST, "missing session").into_response();
+    }
+    match method.as_str() {
+        "tools/list" => {
+            let note = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}});
+            let resp = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "lookup", "description": "Look something up",
+                              "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}}]}});
+            sse(chunked(&format!("event: message\ndata: {note}\n\nevent: message\ndata: {resp}\n\n"), 9))
+        }
+        "tools/call" => {
+            axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "lookup ok"}], "isError": false}}))
+                .into_response()
+        }
+        _ => axum::Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "not found"}})).into_response(),
+    }
+}
+
+async fn start_fake_mcp() -> (String, McpFake) {
+    let fake = McpFake::default();
+    let app = Router::new().route("/mcp", post(fake_mcp)).with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), fake)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_mcp_tools() {
+    let (fake_base, fake) = start_fake().await;
+    let (mcp_base, mcp_fake) = start_fake_mcp().await;
+    let bin = std::env::temp_dir().join(format!("mailbox-ai-mcp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = write_script(&bin, "fake_mcp.py", FAKE_STDIO_MCP);
+    let c = setup(false).await;
+    c.put(
+        "/v1/ai/providers/toolfake",
+        json!({"name": "Tool Fake", "kind": "openai", "base_url": format!("{fake_base}/tools/v1"), "enabled": true,
+               "models": [{"id": "fake-tools"}], "api_key": "sk-tools"}),
+    )
+    .await;
+    let mut s = c.get("/v1/ai/settings").await;
+    s["default_model"] = json!({"provider": "toolfake", "model": "fake-tools"});
+    c.put("/v1/ai/settings", s).await;
+
+    // Server configs: validation, then a stdio and an HTTP server that both work.
+    let (status, _) = c.send(reqwest::Method::POST, "/v1/ai/mcp-servers", Some(json!({"name": "没有命令", "transport": "stdio"}))).await;
+    assert_eq!(status, 400);
+    let (status, _) = c.send(reqwest::Method::POST, "/v1/ai/mcp-servers", Some(json!({"name": "坏地址", "transport": "http", "url": "ftp://x"}))).await;
+    assert_eq!(status, 400);
+    let stdio = c
+        .post("/v1/ai/mcp-servers", json!({"name": "Fake Stdio", "transport": "stdio", "command": "python3", "args": [script.to_string_lossy()]}))
+        .await;
+    let stdio_id = stdio["id"].as_str().unwrap().to_string();
+    assert_eq!(stdio["enabled"], true);
+    let t = c.post(&format!("/v1/ai/mcp-servers/{stdio_id}/test"), json!({})).await;
+    assert_eq!(t["ok"], true, "{t}");
+    assert_eq!(t["tools"], json!([{"name": "echo", "description": "Echo back the text"}]));
+    let http = c
+        .post(
+            "/v1/ai/mcp-servers",
+            json!({"name": "Fake HTTP", "transport": "http", "url": format!("{mcp_base}/mcp"), "headers": {"Authorization": "Bearer mcp-secret"}}),
+        )
+        .await;
+    let http_id = http["id"].as_str().unwrap().to_string();
+    let t = c.post(&format!("/v1/ai/mcp-servers/{http_id}/test"), json!({})).await;
+    assert_eq!(t["ok"], true, "{t}");
+    assert_eq!(t["tools"][0]["name"], "lookup");
+    assert!(mcp_fake.sessions.lock().unwrap().iter().all(|s| s == "sess-1"), "the session id is sent back");
+    let wrong = c.post("/v1/ai/mcp-servers", json!({"name": "Wrong", "enabled": false, "transport": "http", "url": format!("{mcp_base}/mcp")})).await;
+    let t = c.post(&format!("/v1/ai/mcp-servers/{}/test", wrong["id"].as_str().unwrap()), json!({})).await;
+    assert_eq!(t["ok"], false);
+    assert!(t["error"].as_str().unwrap().contains("401"), "{t}");
+    assert_eq!(c.get("/v1/ai/mcp-servers").await.as_array().unwrap().len(), 3);
+
+    // The tool loop: the model calls echo on the stdio server, then answers with the result.
+    let (deltas, done) = c.generate("/v1/ai/chat", json!({"messages": [{"role": "user", "content": "请调用工具"}], "tools": true})).await;
+    assert_eq!(done["text"], "工具说：echo: 你好", "{done}");
+    assert_eq!(deltas, "工具说：echo: 你好");
+    assert_eq!(done["tool_calls"], json!([{"server": "Fake Stdio", "server_id": stdio_id, "tool": "echo", "ok": true}]));
+    let requests = fake.requests.lock().unwrap().clone();
+    let first = requests.iter().find(|r| r["tools"].is_array()).expect("a request with tools").clone();
+    let names: Vec<String> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+    assert!(names.contains(&"FakeStdio__echo".to_string()) && names.contains(&"FakeHTTP__lookup".to_string()), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("Wrong")), "disabled servers are not used");
+    assert_eq!(first["stream"], false);
+    assert!(
+        requests.iter().any(|r| r["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool" && m["content"] == "echo: 你好")),
+        "the tool result goes back to the model"
+    );
+    let usage = c.get("/v1/ai/usage?days=1").await;
+    assert!(usage["by_feature"].as_array().unwrap().iter().any(|f| f["feature"] == "mcp" && f["calls"] == 2), "{usage}");
+
+    // Claude Code gets the servers as --mcp-config.
+    let claude = write_script(
+        &bin,
+        "claude",
+        r#"#!/bin/sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$*" > "$DIR/claude.args"
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--mcp-config" ]; then cp "$a" "$DIR/claude.mcp.json"; fi
+  prev="$a"
+done
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"mcp__FakeStdio__echo","input":{"text":"hi"}}]}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"echo: hi","is_error":false}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"完成"}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"完成","usage":{"input_tokens":5,"output_tokens":3}}'
+"#,
+    );
+    c.put(
+        "/v1/ai/providers/claude_code",
+        json!({"name": "Claude Code", "kind": "claude_code", "base_url": claude.to_string_lossy(), "enabled": true, "models": [{"id": "default"}]}),
+    )
+    .await;
+    let chat = |provider: &str| json!({"model": {"provider": provider, "model": "default"}, "messages": [{"role": "user", "content": "用工具"}], "tools": true});
+    let (_, done) = c.generate("/v1/ai/chat", chat("claude_code")).await;
+    assert_eq!(done["text"], "完成", "{done}");
+    assert_eq!(done["tool_calls"], json!([{"server": "Fake Stdio", "server_id": stdio_id, "tool": "echo", "ok": true}]));
+    let args = std::fs::read_to_string(bin.join("claude.args")).unwrap();
+    assert!(args.contains("--max-turns 8") && args.contains("--mcp-config "), "{args}");
+    assert!(args.contains("mcp__FakeStdio") && args.contains("mcp__FakeHTTP") && !args.contains("mcp__Wrong"), "{args}");
+    assert!(args.contains("--disallowedTools Bash Edit Write Read"), "{args}");
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(bin.join("claude.mcp.json")).unwrap()).unwrap();
+    assert_eq!(config["mcpServers"]["FakeStdio"]["command"], "python3");
+    assert_eq!(config["mcpServers"]["FakeHTTP"]["headers"]["Authorization"], "Bearer mcp-secret");
+
+    // Codex: no external tools.
+    let codex = write_script(
+        &bin,
+        "codex",
+        r#"#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then out="$a"; fi
+  prev="$a"
+done
+cat > /dev/null
+echo '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Codex 回复"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2}}'
+printf '%s' 'Codex 回复' > "$out"
+"#,
+    );
+    c.put(
+        "/v1/ai/providers/codex",
+        json!({"name": "Codex", "kind": "codex", "base_url": codex.to_string_lossy(), "enabled": true, "models": [{"id": "default"}]}),
+    )
+    .await;
+    let (_, done) = c.generate("/v1/ai/chat", chat("codex")).await;
+    assert_eq!(done["text"], "Codex 回复");
+    assert_eq!(done["tools_note"], "Codex 暂不支持外部工具");
+    assert_eq!(done["tool_calls"], json!([]));
+
+    // Deleting.
+    c.send(reqwest::Method::DELETE, &format!("/v1/ai/mcp-servers/{http_id}"), None).await;
+    let (status, _) = c.send(reqwest::Method::DELETE, &format!("/v1/ai/mcp-servers/{http_id}"), None).await;
+    assert_eq!(status, 404);
+    assert_eq!(c.get("/v1/ai/mcp-servers").await.as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+// ---- keys, usage, follow-ups, vacation replies, batch unsubscribe ----------------------------
+
+fn write_eml(dir: &std::path::Path, name: &str, headers: &str, body: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let raw = format!("{headers}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n");
+    std::fs::write(dir.join(name), raw).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_usage_followups_and_vacation() {
+    let (fake_base, fake) = start_fake().await;
+    let c = setup(false).await;
+    let mut st = c.get("/v1/settings").await;
+    st["undo_send_secs"] = json!(120);
+    c.put("/v1/settings", st).await;
+
+    // Two keys: "key-a" is rejected (401) and the next one takes over; requests take turns.
+    let p = c
+        .put(
+            "/v1/ai/providers/rot",
+            json!({"name": "Rotating", "kind": "openai", "base_url": format!("{fake_base}/keys/v1"), "enabled": true,
+                   "models": [{"id": "fake-mini"}], "api_key": "key-a, key-b"}),
+        )
+        .await;
+    assert_eq!(p["key_count"], 2);
+    assert_eq!(p["has_key"], true);
+    assert!(!p.to_string().contains("key-b"), "keys are never returned");
+    let mut s = c.get("/v1/ai/settings").await;
+    s["default_model"] = json!({"provider": "rot", "model": "fake-mini"});
+    s["quick_model"] = json!({"provider": "rot", "model": "fake-mini"});
+    c.put("/v1/ai/settings", s).await;
+    for _ in 0..2 {
+        let (_, done) = c.generate("/v1/ai/chat", json!({"messages": [{"role": "user", "content": "你好"}]})).await;
+        assert_eq!(done["text"], PLAIN_ANSWER);
+    }
+    let auth = fake.auth.lock().unwrap().clone();
+    assert_eq!(auth, vec!["Bearer key-a", "Bearer key-b", "Bearer key-b"]);
+    let last = fake.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last["stream_options"]["include_usage"], true);
+
+    // Usage: per day, model and feature, with the tokens of the usage chunk.
+    let usage = c.get("/v1/ai/usage?days=7").await;
+    let days = usage["days"].as_array().unwrap();
+    assert_eq!(days.len(), 7);
+    let today = days.last().unwrap();
+    assert_eq!(today["calls"], 2, "{usage}");
+    assert_eq!(today["input_tokens"], 22);
+    assert_eq!(today["output_tokens"], 14);
+    assert_eq!(today["errors"], 0);
+    assert_eq!(days[0]["calls"], 0);
+    assert_eq!(usage["by_model"][0]["provider"], "rot");
+    assert_eq!(usage["by_model"][0]["model"], "fake-mini");
+    assert_eq!(usage["by_feature"][0]["feature"], "chat");
+    assert_eq!(usage["by_feature"][0]["calls"], 2);
+
+    // A local (POP-style) account with a sent message that got no answer for five days.
+    let acc = c
+        .engine
+        .db
+        .insert_account(Account {
+            kind: AccountKind::Pop3,
+            email: "me@pop-demo.cn".into(),
+            name: "我".into(),
+            label: "POP".into(),
+            provider: Some("demo".into()),
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let inbox = c.engine.db.ensure_local_folder(&acc.id, FolderRole::Inbox, "收件箱").unwrap();
+    let sent = c.engine.db.ensure_local_folder(&acc.id, FolderRole::Sent, "已发送").unwrap();
+    let five_days_ago = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc2822();
+    let now_date = chrono::Utc::now().to_rfc2822();
+    write_eml(
+        &c.dir.join("sent"),
+        "1.eml",
+        &format!(
+            "From: =?UTF-8?B?5oiR?= <me@pop-demo.cn>\r\nTo: =?UTF-8?B?546L5LqU?= <wangwu@friend-demo.cn>\r\nSubject: =?UTF-8?B?5oql5Lu356Gu6K6k?=\r\n\
+             Message-ID: <quote1@test>\r\nDate: {five_days_ago}\r\n"
+        ),
+        "王总，报价单已经发您了，请确认是否可以？",
+    );
+    assert_eq!(c.engine.import_messages(sent, &c.dir.join("sent")).await.unwrap(), 1);
+    let sent_id = c.engine.db.list_messages(&ListQuery { mailbox: Mailbox::Folder(sent), limit: 10, ..Default::default() }).unwrap()[0].id;
+    let mut events = c.engine.events.subscribe();
+    assert_eq!(c.engine.ai_check_followups().await.unwrap(), 1);
+    let mut reminder_title = String::new();
+    while let Ok(ev) = events.try_recv() {
+        if let Event::AiReminder { message_id, title, .. } = ev {
+            if message_id == sent_id {
+                reminder_title = title;
+            }
+        }
+    }
+    assert!(reminder_title.contains("POP") && reminder_title.contains("王五"), "{reminder_title}");
+    assert_eq!(c.engine.ai_check_followups().await.unwrap(), 0, "judged once");
+    let reminders = c.get("/v1/ai/reminders").await;
+    let item = reminders.as_array().unwrap().iter().find(|r| r["kind"] == "follow_up").expect("follow-up listed").clone();
+    assert_eq!(item["message"]["id"], sent_id);
+    assert_eq!(item["message"]["subject"], "报价确认");
+    assert_eq!(item["insight"]["one_line"], "5 天没收到 王五 的回复");
+    assert_eq!(item["account_label"], "POP");
+    // Done and undone.
+    c.post(&format!("/v1/ai/reminders/{sent_id}/done"), json!({"done": true})).await;
+    assert!(c.get("/v1/ai/reminders").await.as_array().unwrap().iter().all(|r| r["kind"] != "follow_up"));
+    c.post(&format!("/v1/ai/reminders/{sent_id}/done"), json!({"done": false})).await;
+    assert!(c.get("/v1/ai/reminders").await.as_array().unwrap().iter().any(|r| r["kind"] == "follow_up"));
+    // The answer arrives: the follow-up goes away.
+    write_eml(
+        &c.dir.join("reply"),
+        "1.eml",
+        &format!(
+            "From: =?UTF-8?B?546L5LqU?= <wangwu@friend-demo.cn>\r\nTo: me@pop-demo.cn\r\nSubject: Re: =?UTF-8?B?5oql5Lu356Gu6K6k?=\r\n\
+             Message-ID: <reply1@test>\r\nIn-Reply-To: <quote1@test>\r\nReferences: <quote1@test>\r\nDate: {now_date}\r\n"
+        ),
+        "可以，就按这个报价。",
+    );
+    assert_eq!(c.engine.import_messages(inbox, &c.dir.join("reply")).await.unwrap(), 1);
+    let reply_id = c.engine.db.list_messages(&ListQuery { mailbox: Mailbox::Folder(inbox), limit: 10, ..Default::default() }).unwrap()[0].id;
+    c.engine.ai_process_new_mail(reply_id).await;
+    assert!(c.get("/v1/ai/reminders").await.as_array().unwrap().iter().all(|r| r["kind"] != "follow_up"));
+
+    // Vacation replies: no AI, sent directly, once per sender while the vacation lasts.
+    let now = chrono_now();
+    let (status, _) = c.send(reqwest::Method::POST, "/v1/ai/autoreply", Some(json!({"kind": "vacation", "reply_text": " "}))).await;
+    assert_eq!(status, 400);
+    let (status, _) = c
+        .send(reqwest::Method::POST, "/v1/ai/autoreply", Some(json!({"kind": "vacation", "reply_text": "x", "start": now, "end": now - 10})))
+        .await;
+    assert_eq!(status, 400);
+    let rule = c
+        .post("/v1/ai/autoreply", json!({"name": "休假", "kind": "vacation", "reply_text": "我在休假，10 月 30 日回来。", "start": now - 3600, "end": now + 86_400}))
+        .await;
+    assert_eq!(rule["mode"], "send");
+    c.post("/v1/ai/autoreply", json!({"name": "过期的休假", "kind": "vacation", "reply_text": "旧的", "start": now - 10 * 86_400, "end": now - 5 * 86_400}))
+        .await;
+    let dir = c.dir.join("vacation");
+    for (i, (from, subject, mid)) in
+        [("Zhao Liu <zhaoliu@friend-demo.cn>", "Lunch?", "v1@test"), ("Zhao Liu <zhaoliu@friend-demo.cn>", "Again", "v2@test"), ("Shop <noreply@shop-demo.com>", "Order", "v3@test")]
+            .iter()
+            .enumerate()
+    {
+        write_eml(&dir, &format!("{i}.eml"), &format!("From: {from}\r\nTo: me@pop-demo.cn\r\nSubject: {subject}\r\nMessage-ID: <{mid}>\r\nDate: {now_date}\r\n"), "你好");
+    }
+    write_eml(
+        &dir,
+        "9.eml",
+        &format!(
+            "From: Shop News <news@shop-demo.com>\r\nTo: me@pop-demo.cn\r\nSubject: Weekly deals\r\nList-Unsubscribe: <mailto:unsub@shop-demo.com>\r\n\
+             Message-ID: <bulk1@test>\r\nDate: {now_date}\r\n"
+        ),
+        "本周特价。",
+    );
+    assert_eq!(c.engine.import_messages(inbox, &dir).await.unwrap(), 4);
+    let local = c.engine.db.list_messages(&ListQuery { mailbox: Mailbox::Folder(inbox), limit: 20, ..Default::default() }).unwrap();
+    let id_of = |subject: &str| local.iter().find(|m| m.subject == subject).unwrap().id;
+    let mut events = c.engine.events.subscribe();
+    for subject in ["Lunch?", "Again", "Order", "Weekly deals"] {
+        c.engine.ai_process_new_mail(id_of(subject)).await;
+    }
+    let outbox = c.get("/v1/outbox").await;
+    let to_zhao: Vec<Value> = outbox.as_array().unwrap().iter().filter(|o| o["to"][0]["email"] == "zhaoliu@friend-demo.cn").cloned().collect();
+    assert_eq!(to_zhao.len(), 1, "once per sender: {outbox}");
+    assert_eq!(to_zhao[0]["subject"], "自动回复：Lunch?");
+    assert!(outbox.as_array().unwrap().iter().all(|o| o["to"][0]["email"] != "noreply@shop-demo.com" && o["to"][0]["email"] != "news@shop-demo.com"));
+    let cancelled = c.post(&format!("/v1/outbox/{}/cancel", to_zhao[0]["id"].as_str().unwrap()), json!({})).await;
+    assert_eq!(cancelled["draft"]["auto_submitted"], true, "{cancelled}");
+    assert!(cancelled["draft"]["html"].as_str().unwrap().contains("我在休假"), "{cancelled}");
+    let mut vacation_events = 0;
+    while let Ok(ev) = events.try_recv() {
+        if let Event::AiAutoreply { rule_name, sent, draft_id, .. } = ev {
+            assert_eq!((rule_name.as_str(), sent, draft_id), ("休假", true, None));
+            vacation_events += 1;
+        }
+    }
+    assert_eq!(vacation_events, 1);
+
+    // Batch unsubscribe (no AI): List-Unsubscribe mailto is handled, the rest is reported.
+    let r = c.post("/v1/ai/batch", json!({"ids": [id_of("Weekly deals"), id_of("Order")], "op": "unsubscribe"})).await;
+    let job = c.wait_for(&format!("/v1/ai/jobs/{}", r["job_id"].as_str().unwrap()), |j| j["status"] != "running").await;
+    assert_eq!(job["status"], "done", "{job}");
+    let items = job["items"].as_array().unwrap();
+    let bulk = items.iter().find(|i| i["subject"] == "Weekly deals").unwrap();
+    assert_eq!(bulk["output"], "已退订", "{job}");
+    let plain = items.iter().find(|i| i["subject"] == "Order").unwrap();
+    assert!(plain["error"].as_str().unwrap().contains("退订"), "{job}");
+    assert!(job["summary"].as_str().unwrap().starts_with("已退订 1 封"), "{job}");
+    let outbox = c.get("/v1/outbox").await;
+    assert!(outbox.as_array().unwrap().iter().any(|o| o["to"][0]["email"] == "unsub@shop-demo.com"), "{outbox}");
 }

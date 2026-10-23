@@ -9,7 +9,22 @@ use crate::model::{ComposeMode, Draft, MessageId};
 use serde::Deserialize;
 use serde_json::json;
 
-pub const OPS: &[&str] = &["polish", "formal", "friendly", "concise", "expand", "proofread", "translate", "write", "reply", "custom"];
+pub const OPS: &[&str] =
+    &["polish", "formal", "friendly", "concise", "expand", "proofread", "translate", "write", "reply", "custom", "subject"];
+
+/// A generated subject: the first line, without quotes or a 「主题：」 prefix, at most 30
+/// characters.
+pub fn clean_subject(raw: &str) -> String {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let mut s = line.trim_matches('*').trim().to_string();
+    for p in ["主题：", "主题:", "Subject:", "subject:"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            s = rest.trim().to_string();
+        }
+    }
+    let s = s.trim_matches(['「', '」', '"', '“', '”', '《', '》', '\'']).trim();
+    s.chars().take(30).collect()
+}
 
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(default)]
@@ -30,6 +45,7 @@ pub struct ComposeRequest {
 /// Everything resolved before the stream starts (errors become plain HTTP errors).
 #[derive(Debug, Clone)]
 pub struct ComposePlan {
+    pub op: String,
     pub model: ModelRef,
     pub system: String,
     pub user: String,
@@ -54,8 +70,15 @@ impl Engine {
             }
             "reply" => {
                 let id = r.message_id.ok_or_else(|| Error::Invalid("reply 需要 message_id".into()))?;
-                let conversation = self.ai_conversation(id, true, s.max_body_chars).await?;
+                let local = self.ai_model_is_local(&model);
+                let conversation = self.ai_conversation(id, true, s.max_body_chars, local).await?;
                 prompts::reply(&s, &conversation, &instruction)
+            }
+            "subject" => {
+                if text.trim().is_empty() {
+                    return Err(Error::Invalid("请先写好正文，再生成主题".into()));
+                }
+                prompts::subject(&super::truncate_chars(&text, s.max_body_chars))
             }
             "custom" if text.trim().is_empty() => {
                 if instruction.trim().is_empty() {
@@ -77,29 +100,38 @@ impl Engine {
                 prompts::rewrite(op, &text, instruction.trim(), &target).ok_or_else(|| Error::Invalid(format!("未知的写作操作 {op}")))?
             }
         };
-        Ok(ComposePlan { model, system, user })
+        Ok(ComposePlan { op: op.to_string(), model, system, user })
     }
 
-    /// Runs a plan; the `done` line carries `subject` when the model wrote a `主题：` line.
+    /// Runs a plan; the `done` line carries `subject` when the model wrote a `主题：` line
+    /// (op `subject`: the generated subject, same as `text`).
     pub async fn ai_compose_run(&self, plan: ComposePlan, tx: DeltaTx) -> Result<StreamDone> {
         let label = plan.model.label();
-        let raw = self.ai_complete(&plan.model, plan.system, plan.user, false, tx).await?;
+        let raw = self.ai_complete(&plan.model, "compose", plan.system, plan.user, false, tx).await?;
+        if plan.op == "subject" {
+            let subject = clean_subject(&clean_output(&raw));
+            if subject.is_empty() {
+                return Err(Error::Ai("AI 没有给出主题".into()));
+            }
+            return Ok(StreamDone::new(subject.clone(), label).with("subject", json!(subject)));
+        }
         let (text, subject) = split_subject(&clean_output(&raw));
         Ok(StreamDone::new(text, label).with("subject", json!(subject)))
     }
 
     /// Reply text for the last message of a conversation (no subject line).
-    pub(crate) async fn ai_reply_text(&self, id: MessageId, instruction: &str, model: &ModelRef, tx: DeltaTx) -> Result<String> {
+    pub(crate) async fn ai_reply_text(&self, id: MessageId, instruction: &str, model: &ModelRef, feature: &str, tx: DeltaTx) -> Result<String> {
         let s = self.ai_settings();
-        let conversation = self.ai_conversation(id, true, s.max_body_chars).await?;
+        let local = self.ai_model_is_local(model);
+        let conversation = self.ai_conversation(id, true, s.max_body_chars, local).await?;
         let (system, user) = prompts::reply(&s, &conversation, instruction);
-        let raw = self.ai_complete(model, system, user, false, tx).await?;
+        let raw = self.ai_complete(model, feature, system, user, false, tx).await?;
         Ok(split_subject(&clean_output(&raw)).0)
     }
 
     /// The normal reply draft (quote, signature) with the AI text in front. Not saved.
-    pub(crate) async fn ai_reply_draft(&self, id: MessageId, text: &str, auto_submitted: bool) -> Result<Draft> {
-        let mut d = self.reply_draft(id, ComposeMode::Reply).await?;
+    pub(crate) async fn ai_reply_draft(&self, id: MessageId, text: &str, mode: ComposeMode, auto_submitted: bool) -> Result<Draft> {
+        let mut d = self.reply_draft(id, mode).await?;
         let rest = d.html.strip_prefix("<div><br></div><div><br></div>").unwrap_or(&d.html).to_string();
         d.html = format!("{}{}", text_html(text), rest);
         d.auto_submitted = auto_submitted;
@@ -108,11 +140,24 @@ impl Engine {
 
     /// Saves a reply draft locally and uploads it to the server's Drafts folder.
     pub(crate) async fn ai_save_reply_draft(&self, id: MessageId, text: &str) -> Result<Draft> {
-        let d = self.ai_reply_draft(id, text, false).await?;
+        let d = self.ai_reply_draft(id, text, ComposeMode::Reply, false).await?;
         let d = self.save_draft(d)?;
         if let Err(err) = self.sync_draft(&d.id).await {
             tracing::warn!(error = %err, "could not upload ai draft");
         }
         Ok(d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subjects_are_cleaned() {
+        assert_eq!(clean_subject("主题：「下周二评审会时间确认」\n多余的行"), "下周二评审会时间确认");
+        assert_eq!(clean_subject("\n**Subject: Q4 plan**"), "Q4 plan");
+        assert_eq!(clean_subject("一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十多出来的"), "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十");
+        assert!(OPS.contains(&"subject"));
     }
 }

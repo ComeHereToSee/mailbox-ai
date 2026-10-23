@@ -1,17 +1,20 @@
-//! `/v1/ai/*` routes (contract: `docs/AI.md` §4). Generating endpoints answer with an
-//! NDJSON stream: `{"delta":…}` lines, then `{"done":true,"text","model",…}` or `{"error":…}`.
-//! Errors found before the stream starts are ordinary `{"error","code"}` HTTP errors.
+//! `/v1/ai/*` routes (contract: `docs/AI.md` §4 and §8) and the built-in MCP server
+//! (`/mcp`). Generating endpoints answer with an NDJSON stream: `{"delta":…}` lines, then
+//! `{"done":true,"text","model",…}` or `{"error":…}`. Errors found before the stream starts
+//! are ordinary `{"error","code"}` HTTP errors.
 
 use super::{ApiError, ApiResult, AppState};
 use crate::ai::compose::ComposeRequest;
-use crate::ai::{AiLoop, AiProvider, AiProviderInput, AiSettings, AutoReplyRule, ChatMessage, ModelRef, StreamDone};
+use crate::ai::{
+    AiLoop, AiProvider, AiProviderInput, AiSettings, AutoReplyRule, ChatMessage, McpServerConfig, ModelRef, PromptPreset, StreamDone,
+};
 use crate::error::{Error, Result};
 use crate::model::MessageId;
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
@@ -52,6 +55,21 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/ai/autoreply/{id}", delete(delete_autoreply))
         .route("/v1/ai/ask", post(ask))
         .route("/v1/ai/demo", post(demo))
+        .route("/v1/ai/messages/{id}/events", post(extract_events))
+        .route("/v1/ai/messages/{id}/prompt", post(message_prompt))
+        .route("/v1/ai/messages/{id}/attachments/{aid}/explain", post(explain))
+        .route("/v1/ai/usage", get(usage))
+        .route("/v1/ai/mcp", get(mcp_info))
+        .route("/v1/ai/mcp/token", post(mcp_token))
+        .route("/v1/ai/confirm", get(confirmations))
+        .route("/v1/ai/confirm/{id}", post(decide))
+        .route("/v1/ai/mcp-servers", get(mcp_servers).post(save_mcp_server))
+        .route("/v1/ai/mcp-servers/{id}", delete(delete_mcp_server))
+        .route("/v1/ai/mcp-servers/{id}/test", post(test_mcp_server))
+        .route("/v1/ai/prompts", get(prompt_list).post(save_prompt))
+        .route("/v1/ai/prompts/{id}", delete(delete_prompt))
+        // Its own authentication (API token or MCP token): see `super::auth`.
+        .route("/mcp", post(mcp).get(mcp_get))
 }
 
 fn ok() -> Json<Value> {
@@ -194,6 +212,8 @@ struct ChatBody {
     model: Option<ModelRef>,
     system: Option<String>,
     messages: Vec<ChatMessage>,
+    /// Use the enabled external MCP servers.
+    tools: bool,
 }
 
 async fn chat(State(st): St, b: Bytes) -> ApiResult<Response> {
@@ -203,8 +223,8 @@ async fn chat(State(st): St, b: Bytes) -> ApiResult<Response> {
     }
     let model = st.engine.ai_model_or(c.model, false)?;
     let e = st.engine.clone();
-    let (system, messages) = (c.system, c.messages);
-    Ok(ndjson(move |tx| async move { e.ai_chat_stream(model, system, messages, Some(tx)).await }))
+    let (system, messages, tools) = (c.system, c.messages, c.tools);
+    Ok(ndjson(move |tx| async move { e.ai_chat_stream(model, system, messages, tools, Some(tx)).await }))
 }
 
 async fn compose(State(st): St, b: Bytes) -> ApiResult<Response> {
@@ -386,6 +406,7 @@ async fn delete_autoreply(State(st): St, Path(id): Path<String>) -> ApiResult<Js
 struct AskBody {
     question: String,
     mailbox: Option<String>,
+    tools: bool,
 }
 
 async fn ask(State(st): St, b: Bytes) -> ApiResult<Response> {
@@ -401,10 +422,180 @@ async fn ask(State(st): St, b: Bytes) -> ApiResult<Response> {
     // Fail before streaming when no model is configured.
     st.engine.ai_model(false)?;
     let e = st.engine.clone();
-    let (question, mailbox) = (a.question, a.mailbox);
-    Ok(ndjson(move |tx| async move { e.ai_ask(question, mailbox, Some(tx)).await }))
+    let (question, mailbox, tools) = (a.question, a.mailbox, a.tools);
+    Ok(ndjson(move |tx| async move { e.ai_ask(question, mailbox, tools, Some(tx)).await }))
 }
 
 async fn demo(State(st): St) -> ApiResult<Json<Value>> {
     Ok(Json(st.engine.ai_seed_demo()?))
+}
+
+// ---- calendar, custom prompts, attachments ---------------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ForceBody {
+    force: bool,
+}
+
+async fn extract_events(State(st): St, Path(id): Path<MessageId>, b: Bytes) -> ApiResult<Json<Value>> {
+    let f: ForceBody = body(&b)?;
+    let (events, cached) = st.engine.ai_extract_events(id, f.force).await?;
+    Ok(Json(json!({ "events": events, "cached": cached })))
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct PromptBody {
+    prompt: String,
+    thread: bool,
+}
+
+impl Default for PromptBody {
+    fn default() -> Self {
+        PromptBody { prompt: String::new(), thread: true }
+    }
+}
+
+async fn message_prompt(State(st): St, Path(id): Path<MessageId>, b: Bytes) -> ApiResult<Response> {
+    let pb: PromptBody = body(&b)?;
+    let plan = st.engine.ai_message_prompt_plan(id, &pb.prompt, pb.thread).await?;
+    let e = st.engine.clone();
+    Ok(ndjson(move |tx| async move { e.ai_message_prompt_run(plan, Some(tx)).await }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ExplainBody {
+    text: Option<String>,
+    question: Option<String>,
+}
+
+async fn explain(State(st): St, Path((id, aid)): Path<(MessageId, i64)>, b: Bytes) -> ApiResult<Response> {
+    let eb: ExplainBody = body(&b)?;
+    let plan = st.engine.ai_explain_plan(id, aid, eb.text, eb.question).await?;
+    let e = st.engine.clone();
+    Ok(ndjson(move |tx| async move { e.ai_explain_run(plan, Some(tx)).await }))
+}
+
+// ---- usage ------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    days: Option<u32>,
+}
+
+async fn usage(State(st): St, Query(q): Query<UsageQuery>) -> Json<Value> {
+    Json(json!(st.engine.ai_usage(q.days.unwrap_or(30))))
+}
+
+// ---- MCP --------------------------------------------------------------------------------
+
+async fn mcp_info(State(st): St) -> ApiResult<Json<Value>> {
+    let enabled = st.engine.ai_settings().mcp_enabled;
+    let token = st.engine.ai_mcp_token()?;
+    Ok(Json(json!({
+        "enabled": enabled,
+        "url": format!("http://127.0.0.1:{}/mcp", st.port),
+        "token": token,
+        // Filled in by the app (path of the helper with `--mcp`).
+        "stdio_command": "",
+    })))
+}
+
+async fn mcp_token(State(st): St) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "token": st.engine.ai_regenerate_mcp_token()? })))
+}
+
+async fn confirmations(State(st): St) -> Json<Value> {
+    Json(json!(st.engine.ai_confirmations()))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DecideBody {
+    approve: bool,
+}
+
+async fn decide(State(st): St, Path(id): Path<String>, b: Bytes) -> ApiResult<Json<Value>> {
+    let d: DecideBody = body(&b)?;
+    st.engine.ai_decide(&id, d.approve)?;
+    Ok(ok())
+}
+
+async fn mcp_servers(State(st): St) -> Json<Vec<McpServerConfig>> {
+    Json(st.engine.ai_mcp_servers())
+}
+
+async fn save_mcp_server(State(st): St, b: Bytes) -> ApiResult<Json<McpServerConfig>> {
+    let c: McpServerConfig = body(&b)?;
+    Ok(Json(st.engine.ai_save_mcp_server(c)?))
+}
+
+async fn delete_mcp_server(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    st.engine.ai_delete_mcp_server(&id)?;
+    Ok(ok())
+}
+
+async fn test_mcp_server(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(st.engine.ai_test_mcp_server(&id).await?))
+}
+
+fn jsonrpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Response {
+    (status, Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))).into_response()
+}
+
+/// `POST /mcp`: one JSON-RPC message. Accepts the per-launch API token or the MCP token.
+async fn mcp(State(st): St, headers: HeaderMap, b: Bytes) -> Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string());
+    let authorized = match bearer.as_deref() {
+        Some(t) if !t.is_empty() => {
+            super::constant_eq(t.as_bytes(), st.token.as_bytes())
+                || st.engine.ai_mcp_token().map(|m| super::constant_eq(t.as_bytes(), m.as_bytes())).unwrap_or(false)
+        }
+        _ => false,
+    };
+    if !authorized {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized", "code": "token" }))).into_response();
+    }
+    let msg: Value = match serde_json::from_slice(&b) {
+        Ok(v) => v,
+        Err(_) => return jsonrpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, "Parse error"),
+    };
+    if !msg.is_object() {
+        return jsonrpc_error(StatusCode::BAD_REQUEST, Value::Null, -32600, "Invalid Request: send one JSON-RPC object");
+    }
+    if !st.engine.ai_settings().mcp_enabled {
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        return jsonrpc_error(StatusCode::FORBIDDEN, id, -32001, crate::ai::mcp_server::DISABLED);
+    }
+    match st.engine.ai_mcp_handle(&msg).await {
+        Some(resp) => Json(resp).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// No server-sent event stream: `GET /mcp` is not supported.
+async fn mcp_get() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
+// ---- prompt library ---------------------------------------------------------------------
+
+async fn prompt_list(State(st): St) -> Json<Vec<PromptPreset>> {
+    Json(st.engine.ai_prompts())
+}
+
+async fn save_prompt(State(st): St, b: Bytes) -> ApiResult<Json<PromptPreset>> {
+    let p: PromptPreset = body(&b)?;
+    Ok(Json(st.engine.ai_save_prompt(p)?))
+}
+
+async fn delete_prompt(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    st.engine.ai_delete_prompt(&id)?;
+    Ok(ok())
 }

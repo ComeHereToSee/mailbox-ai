@@ -1,20 +1,34 @@
 //! AI features (contract: `docs/AI.md`): providers and models, streaming chat over HTTP
 //! APIs and the local `claude` / `codex` command lines, writing help, summaries, smart
-//! reminders, batch jobs, scheduled loops, auto replies and "ask the mailbox".
+//! reminders, batch jobs, scheduled loops, auto replies and "ask the mailbox"; second batch
+//! (§8): calendar extraction, the built-in MCP server and external MCP tools, several keys
+//! per provider, model capabilities, usage statistics, attachment explanations, account
+//! policies, notification modes, phishing hints, follow-ups, vacation replies and a prompt
+//! library.
 
 pub mod ask;
 pub mod autoreply;
 pub mod batch;
+pub mod calendar;
 pub mod cli;
 pub mod client;
 pub mod compose;
 mod demo;
+pub mod explain;
+pub mod followup;
 pub mod insight;
 pub mod loops;
+pub mod mcp_client;
+pub mod mcp_server;
 pub mod model;
+pub mod notify;
+pub mod policy;
 pub mod prompts;
+pub mod prompts_lib;
 pub mod providers;
 pub mod summary;
+pub mod tools;
+pub mod usage;
 
 pub use model::*;
 
@@ -27,8 +41,8 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +67,20 @@ pub struct AiState {
     last_prune: AtomicI64,
     /// HTTP client without a total timeout (responses stream for minutes); 15 s to connect.
     http: reqwest::Client,
+    /// Key rotation: the next start index per provider.
+    key_cursor: Mutex<HashMap<String, usize>>,
+    /// OpenAI compatible providers that rejected `stream_options`.
+    no_stream_options: Mutex<HashSet<String>>,
+    /// Serialises the read-modify-write of usage rows.
+    usage_lock: Mutex<()>,
+    /// MCP send / delete requests waiting for the user.
+    confirms: Mutex<HashMap<String, mcp_server::PendingConfirm>>,
+    /// Get-or-create of the MCP token.
+    mcp_token_lock: Mutex<()>,
+    /// Notifications held for the smart analysis ("important" mode): message → since.
+    held: Mutex<HashMap<MessageId, i64>>,
+    last_followup: AtomicI64,
+    followup_running: AtomicBool,
 }
 
 impl AiState {
@@ -67,6 +95,15 @@ impl AiState {
             last_minute: AtomicI64::new(0),
             last_prune: AtomicI64::new(0),
             http: ai_http_client(),
+            key_cursor: Mutex::new(HashMap::new()),
+            no_stream_options: Mutex::new(HashSet::new()),
+            usage_lock: Mutex::new(()),
+            confirms: Mutex::new(HashMap::new()),
+            mcp_token_lock: Mutex::new(()),
+            held: Mutex::new(HashMap::new()),
+            // The first follow-up check runs about five minutes after start.
+            last_followup: AtomicI64::new(crate::store::now() - followup::INTERVAL + 300),
+            followup_running: AtomicBool::new(false),
         }
     }
 }
@@ -119,7 +156,22 @@ pub struct MailText {
     pub from: String,
     pub from_email: String,
     pub date: i64,
+    /// `名字 <email>, …`
+    pub to: String,
+    pub cc: String,
+    /// File names of the (non-inline) attachments.
+    pub attachments: Vec<String>,
     pub text: String,
+}
+
+fn addr_text(list: &[crate::model::EmailAddress]) -> String {
+    list.iter()
+        .map(|a| match &a.name {
+            Some(n) if !n.is_empty() => format!("{n} <{}>", a.email),
+            _ => a.email.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---- engine plumbing --------------------------------------------------------------------
@@ -143,7 +195,8 @@ pub(crate) fn start(e: &Engine) {
     });
 }
 
-/// Housekeeping hook (every 30 s): due reminders and loops, once a minute.
+/// Housekeeping hook (every 30 s): due reminders and loops once a minute, follow-ups once
+/// an hour, cleanup once a day.
 pub(crate) fn tick(e: &Engine) {
     let now = crate::store::now();
     let minute = now / 60;
@@ -152,9 +205,13 @@ pub(crate) fn tick(e: &Engine) {
     }
     insight::check_reminders(e, now);
     loops::schedule_due(e, now);
+    followup::schedule(e, now);
     if now - e.ai.last_prune.load(Ordering::Relaxed) > 86_400 {
         e.ai.last_prune.store(now, Ordering::Relaxed);
         insight::prune(e, now);
+        calendar::prune(e);
+        followup::prune(e, now);
+        usage::prune(e);
     }
 }
 
@@ -166,17 +223,21 @@ impl Engine {
         }
     }
 
-    /// What the background queue does for one new inbox message: smart analysis (when
-    /// enabled and in scope), then auto reply rules. Errors are logged, not returned.
+    /// What the background queue does for one new inbox message: follow-ups answered by it
+    /// go away, smart analysis (when enabled and in scope) and the notification held for it
+    /// ("important" mode), then auto reply rules. Errors are logged, not returned.
     pub async fn ai_process_new_mail(&self, id: MessageId) {
+        followup::on_new_mail(self, id);
         let s = self.ai_settings();
+        let mut analysed: Option<Insight> = None;
         if s.smart_reminders && insight::in_scope(self, &s, id) {
             match self.ai_analyze(id).await {
-                Ok(_) => {}
+                Ok(ins) => analysed = Some(ins),
                 Err(Error::AiNotConfigured(_)) | Err(Error::AiRefused(_)) => {}
                 Err(err) => tracing::warn!(message_id = id, error = %err, "smart analysis failed"),
             }
         }
+        self.ai_release_notification(id, analysed.as_ref());
         if let Err(err) = autoreply::process(self, id).await {
             match err {
                 Error::AiNotConfigured(_) | Error::AiRefused(_) => {}
@@ -201,6 +262,11 @@ impl Engine {
         if s.language.trim().is_empty() {
             s.language = "zh-CN".into();
         }
+        if !matches!(s.notify_mode.as_str(), "normal" | "annotate" | "important") {
+            s.notify_mode = "normal".into();
+        }
+        s.followup_days = s.followup_days.min(60);
+        s.account_policies.retain(|k, v| !k.trim().is_empty() && matches!(v.as_str(), "on" | "off" | "local_only"));
         self.db.kv_put("ai", "settings", &s, 0)
     }
 
@@ -242,7 +308,8 @@ impl Engine {
         self.ai_model(quick)
     }
 
-    /// Streams text deltas into `tx`; returns the full text.
+    /// Streams text deltas into `tx`; returns the full text. Every call is counted in the
+    /// usage statistics (`req.feature`, "chat" when empty).
     pub async fn ai_chat(&self, req: ChatRequest, tx: Option<mpsc::Sender<String>>) -> Result<String> {
         let provider = self
             .ai_provider(&req.model.provider)
@@ -250,19 +317,45 @@ impl Engine {
         if req.messages.is_empty() {
             return Err(Error::Invalid("没有要发送给 AI 的内容".into()));
         }
-        tracing::debug!(provider = %provider.id, model = %req.model.model, "ai request");
-        match provider.kind {
-            ProviderKind::ClaudeCode => cli::claude_chat(self, &provider, &req, tx).await,
-            ProviderKind::Codex => cli::codex_chat(self, &provider, &req, tx).await,
+        if !req.images.is_empty() && provider.kind.is_cli() {
+            return Err(Error::AiNotConfigured(format!("{} 不支持看图：{}", provider.name, explain::VISION_NEEDED)));
+        }
+        let feature = if req.feature.trim().is_empty() { "chat".to_string() } else { req.feature.clone() };
+        tracing::debug!(provider = %provider.id, model = %req.model.model, feature = %feature, "ai request");
+        let started = Instant::now();
+        let result: Result<(String, TokenUsage)> = match provider.kind {
+            ProviderKind::ClaudeCode => cli::claude_chat(self, &provider, &req, tx, None).await.map(|o| (o.text, o.usage)),
+            ProviderKind::Codex => cli::codex_chat(self, &provider, &req, tx).await.map(|o| (o.text, o.usage)),
             _ => {
-                let key = self.secrets.get(&providers::key_name(&provider.id));
-                client::chat(&self.ai.http, &provider, key.as_deref(), &req, tx).await
+                let keys = self.ai_key_list(&provider.id);
+                let start = self.ai_next_key(&provider.id);
+                let stream_options = !self.ai.no_stream_options.lock().contains(&provider.id);
+                match client::chat(&self.ai.http, &provider, client::Keys::new(&keys, start), stream_options, &req, tx).await {
+                    Ok(out) => {
+                        if out.stream_options_rejected {
+                            self.ai.no_stream_options.lock().insert(provider.id.clone());
+                        }
+                        Ok((out.text, out.usage))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        let ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok((text, usage)) => {
+                self.ai_record_usage(&provider.id, &req.model.model, &feature, usage, ms, true);
+                Ok(text)
+            }
+            Err(err) => {
+                self.ai_record_usage(&provider.id, &req.model.model, &feature, TokenUsage::default(), ms, false);
+                Err(err)
             }
         }
     }
 
     /// One system + one user message.
-    pub(crate) async fn ai_complete(&self, model: &ModelRef, system: String, user: String, json: bool, tx: DeltaTx) -> Result<String> {
+    pub(crate) async fn ai_complete(&self, model: &ModelRef, feature: &str, system: String, user: String, json: bool, tx: DeltaTx) -> Result<String> {
         let req = ChatRequest {
             model: model.clone(),
             system: Some(system),
@@ -270,32 +363,47 @@ impl Engine {
             temperature: None,
             max_tokens: None,
             json,
+            feature: feature.to_string(),
+            images: Vec::new(),
         };
         self.ai_chat(req, tx).await
     }
 
     /// Asks for a JSON object and extracts it from the answer (models like ``` fences).
-    pub(crate) async fn ai_json(&self, model: &ModelRef, system: String, user: String) -> Result<Value> {
-        let text = self.ai_complete(model, system, user, true, None).await?;
+    pub(crate) async fn ai_json(&self, model: &ModelRef, feature: &str, system: String, user: String) -> Result<Value> {
+        let text = self.ai_complete(model, feature, system, user, true, None).await?;
         // The answer may quote the message: it is not put into the error (errors get logged).
         extract_json(&text).ok_or_else(|| Error::Ai(format!("AI 返回的内容不是有效的 JSON（{} 个字符）", text.chars().count())))
     }
 
-    /// `/v1/ai/chat`.
-    pub async fn ai_chat_stream(&self, model: ModelRef, system: Option<String>, messages: Vec<ChatMessage>, tx: DeltaTx) -> Result<StreamDone> {
+    /// `/v1/ai/chat`; with `tools` the enabled external MCP servers can be used.
+    pub async fn ai_chat_stream(
+        &self,
+        model: ModelRef,
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+        tools: bool,
+        tx: DeltaTx,
+    ) -> Result<StreamDone> {
         let label = model.label();
         let system = match system.filter(|s| !s.trim().is_empty()) {
             Some(s) => s,
             None => format!("{}\n{}", prompts::ASSISTANT, now_context()),
         };
-        let req = ChatRequest { model, system: Some(system), messages, temperature: None, max_tokens: None, json: false };
+        if tools {
+            return self.ai_tool_chat(model, system, messages, "chat", tx).await;
+        }
+        let req = ChatRequest { model, system: Some(system), messages, feature: "chat".into(), ..Default::default() };
         let text = self.ai_chat(req, tx).await?;
         Ok(StreamDone::new(text, label))
     }
 
     /// Plain text of one message for a prompt (quoted history stripped when `strip`).
-    /// Encrypted messages are refused unless `allow_encrypted`.
-    pub(crate) async fn ai_mail_text(&self, id: MessageId, max_chars: usize, strip: bool) -> Result<MailText> {
+    /// The account's AI policy is checked first (`local`: the model runs on this machine);
+    /// encrypted messages are refused unless `allow_encrypted`.
+    pub(crate) async fn ai_mail_text(&self, id: MessageId, max_chars: usize, strip: bool, local: bool) -> Result<MailText> {
+        let account_id = self.db.message(id)?.summary.account_id;
+        self.ai_check_account(&account_id, local)?;
         let d = self.message_detail(id).await?;
         if d.encrypted {
             if !self.ai_settings().allow_encrypted {
@@ -326,6 +434,9 @@ impl Engine {
             from,
             from_email: d.summary.from.email.clone(),
             date: d.summary.date,
+            to: addr_text(&d.summary.to),
+            cc: addr_text(&d.cc),
+            attachments: d.attachments.iter().filter(|a| !a.inline).map(|a| a.filename.clone()).collect(),
             text: truncate_chars(&text, max_chars),
         })
     }
@@ -352,8 +463,9 @@ impl Engine {
         Ok(ids)
     }
 
-    /// The message (or its whole conversation) as numbered plain-text blocks.
-    pub(crate) async fn ai_conversation(&self, id: MessageId, thread: bool, budget: usize) -> Result<String> {
+    /// The message (or its whole conversation) as numbered plain-text blocks. Messages the
+    /// account policy keeps from this model are left out (the asked one is an error).
+    pub(crate) async fn ai_conversation(&self, id: MessageId, thread: bool, budget: usize, local: bool) -> Result<String> {
         let mut ids = if thread { self.ai_thread_ids(id)? } else { vec![id] };
         // Long conversations: the newest messages matter most.
         if ids.len() > 12 {
@@ -365,7 +477,7 @@ impl Engine {
         let per = (budget / ids.len().max(1)).max(1500);
         let mut parts = Vec::new();
         for (i, mid) in ids.iter().enumerate() {
-            let block = match self.ai_mail_text(*mid, per, true).await {
+            let block = match self.ai_mail_text(*mid, per, true, local).await {
                 Ok(t) => format!(
                     "【邮件 {}】\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
                     i + 1,

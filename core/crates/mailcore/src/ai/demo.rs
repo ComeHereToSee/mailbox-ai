@@ -1,15 +1,18 @@
 //! `POST /v1/ai/demo`: AI demo data on top of the demo accounts, so the UI (and CI
-//! screenshots) show AI cards and the "待处理" list without a real model.
+//! screenshots) show AI cards, the "待处理" list, calendar entries, a phishing warning, a
+//! follow-up, MCP settings and usage charts without a real model.
 
+use super::followup::{FollowUp, SPACE as FOLLOWUP_SPACE};
 use super::insight::{SPACE as INSIGHT_SPACE, compute_remind_at_local};
 use super::loops::{next_run_local, templates};
-use super::model::{Insight, LoopRun, LoopSchedule, ModelRef, SummaryCache};
-use super::local_timestamp;
+use super::model::{ExtractedEvent, Insight, LoopRun, LoopSchedule, McpServerConfig, ModelRef, SummaryCache, TokenUsage};
+use super::{local_timestamp, usage};
 use crate::Engine;
 use crate::error::Result;
 use crate::events::Event;
-use crate::model::{Mailbox, MessageSummary};
-use crate::store::{ListQuery, new_id, now};
+use crate::mime::build::{self, Outgoing};
+use crate::model::{Account, Category, EmailAddress, Flags, FolderRole, Mailbox, MessageId, MessageSummary};
+use crate::store::{ListQuery, NewMessage, new_id, now};
 use chrono::Datelike;
 use serde_json::{Value, json};
 
@@ -51,6 +54,26 @@ fn next_nov_9() -> i64 {
     now() + 14 * 86_400
 }
 
+const PHISHING_SUBJECT: &str = "您的 Apple ID 已被锁定，请立即验证";
+const PHISHING_HTML: &str = "<p>尊敬的用户：</p><p>我们检测到您的 Apple ID 在异地登录，账户已被临时锁定。请在 <b>24 小时内</b>点击下方链接验证身份，\
+并重新输入密码和短信验证码，否则账户将被永久停用。</p><p><a href=\"http://apple-id-verify.demo/unlock\">立即验证</a></p><p>Apple 支持团队</p>";
+const FOLLOWUP_SUBJECT: &str = "合作方案报价，请确认";
+const FOLLOWUP_HTML: &str = "<p>赵经理您好，</p><p>附上我们的合作方案和报价，麻烦您看一下是否合适，有问题随时联系我。期待您的回复！</p><p>谢谢</p>";
+
+/// The hike of 张三's message: Saturday 08:00 at the west hill gate.
+fn hike_event() -> ExtractedEvent {
+    let start = next_weekday_at(6, "08:00");
+    ExtractedEvent {
+        title: "西山爬山".into(),
+        start,
+        end: Some(start + 4 * 3600),
+        all_day: false,
+        location: Some("西山门口".into()),
+        notes: "张三约周六早上 8 点在西山门口集合，记得带水".into(),
+        source_text: "周六早上 8 点".into(),
+    }
+}
+
 fn insight(needs_reply: bool, priority: &str, deadline: Option<i64>, deadline_text: Option<&str>, todos: &[&str], one_line: &str) -> Insight {
     Insight {
         needs_reply,
@@ -78,6 +101,8 @@ impl Engine {
         let _ = self.ai_providers();
         let mut s = self.ai_settings();
         s.default_model = Some(ModelRef::new("claude_code", "default"));
+        // The MCP page shows its URL and token in the screenshots.
+        s.mcp_enabled = true;
         self.save_ai_settings(&s)?;
 
         // Smart reminders.
@@ -112,6 +137,7 @@ impl Engine {
             ),
         ];
         let mut insights = 0;
+        let mut events_id: Option<MessageId> = None;
         for (needle, mut ins) in items {
             let Some(m) = find(needle) else { continue };
             ins.message_id = m.id;
@@ -119,10 +145,83 @@ impl Engine {
             ins.remind_at = compute_remind_at_local(ins.deadline, t);
             // No notifications pop up while the demo is being looked at.
             ins.reminded = true;
+            if needle == "周末爬山" {
+                // A calendar entry (8.1).
+                ins.events = vec![hike_event()];
+                self.ai_store_events(m.id, &ins.events, "claude_code/default")?;
+                events_id = Some(m.id);
+            }
             self.db.kv_put(INSIGHT_SPACE, &m.id.to_string(), &ins, 0)?;
             self.events.emit(Event::AiInsight { message_id: m.id });
             insights += 1;
         }
+
+        // A phishing message with its warning (8.7).
+        let accounts = self.db.accounts()?;
+        let work = accounts.iter().find(|a| a.email == "me@qq-demo.com").or_else(|| accounts.first()).cloned();
+        let mut phishing_id: Option<MessageId> = None;
+        let mut followup_id: Option<MessageId> = None;
+        if let Some(acc) = &work {
+            let id = self.ai_demo_message(
+                acc,
+                FolderRole::Inbox,
+                "phishing",
+                EmailAddress::new(Some("Apple 支持"), "security@apple-id-verify.demo"),
+                EmailAddress::new(Some(acc.name.as_str()), &acc.email),
+                PHISHING_SUBJECT,
+                PHISHING_HTML,
+                t - 6 * 3600,
+                false,
+            )?;
+            let mut ins = insight(false, "high", None, None, &[], "冒充 Apple 的钓鱼邮件，不要点击链接");
+            ins.message_id = id;
+            ins.created_at = t;
+            ins.reminded = true;
+            ins.risk = Some("phishing".into());
+            ins.risk_reason = "冒充 Apple 要求点击链接输入密码和验证码，发件域名不是 apple.com".into();
+            self.db.kv_put(INSIGHT_SPACE, &id.to_string(), &ins, 0)?;
+            self.events.emit(Event::AiInsight { message_id: id });
+            insights += 1;
+            phishing_id = Some(id);
+
+            // Own mail of five days ago without an answer: a follow-up (8.7).
+            let id = self.ai_demo_message(
+                acc,
+                FolderRole::Sent,
+                "followup",
+                EmailAddress::new(Some(acc.name.as_str()), &acc.email),
+                EmailAddress::new(Some("赵六"), "zhaoliu@partner-demo.cn"),
+                FOLLOWUP_SUBJECT,
+                FOLLOWUP_HTML,
+                t - 5 * 86_400,
+                true,
+            )?;
+            let f = FollowUp {
+                message_id: id,
+                awaits_reply: true,
+                reason: "询问对方是否接受报价，需要对方确认".into(),
+                checked_at: t,
+                done: false,
+                reminded: true,
+            };
+            self.db.kv_put(FOLLOWUP_SPACE, &id.to_string(), &f, 0)?;
+            followup_id = Some(id);
+        }
+
+        // An external MCP server (off) and seven days of usage (8.3, 8.4).
+        if !self.ai_mcp_servers().iter().any(|c| c.id == "demo-filesystem") {
+            let cfg = McpServerConfig {
+                id: "demo-filesystem".into(),
+                name: "文件系统".into(),
+                enabled: false,
+                transport: "stdio".into(),
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into(), "~/Documents".into()],
+                ..Default::default()
+            };
+            self.ai_save_mcp_server(cfg)?;
+        }
+        self.ai_demo_usage();
 
         // A cached summary of the meeting notes.
         let mut summary_id = None;
@@ -168,6 +267,83 @@ impl Engine {
             "summary_message_id": summary_id,
             "loop_id": l.id,
             "default_model": s.default_model,
+            "events_message_id": events_id,
+            "phishing_message_id": phishing_id,
+            "followup_message_id": followup_id,
         }))
+    }
+
+    /// Inserts (once, by key) a local demo message into a folder of a demo account.
+    #[allow(clippy::too_many_arguments)]
+    fn ai_demo_message(
+        &self,
+        acc: &Account,
+        role: FolderRole,
+        key: &str,
+        from: EmailAddress,
+        to: EmailAddress,
+        subject: &str,
+        html: &str,
+        date: i64,
+        seen: bool,
+    ) -> Result<MessageId> {
+        let folder = match self.db.folder_by_role(&acc.id, role)? {
+            Some(f) => f.id,
+            None => self.db.ensure_local_folder(&acc.id, role, role.as_str())?,
+        };
+        let o = Outgoing {
+            from,
+            to: vec![to],
+            subject: subject.to_string(),
+            html: Some(html.to_string()),
+            text: crate::html::html_to_text(html),
+            message_id: build::new_message_id(&acc.email),
+            date,
+            ..Default::default()
+        };
+        let raw = build::build(&o, false)?;
+        let h = crate::mime::parse_headers(&raw);
+        let nm = NewMessage {
+            account_id: acc.id.clone(),
+            folder_id: folder,
+            remote_id: Some(format!("demo-ai:{key}")),
+            message_id: h.message_id.clone(),
+            subject: h.subject.clone(),
+            from: h.from.clone(),
+            to: h.to.clone(),
+            date,
+            size: raw.len() as i64,
+            flags: Flags { seen, ..Default::default() },
+            category: Category::Primary,
+            ..Default::default()
+        };
+        let (id, inserted) = self.db.insert_message(&nm)?;
+        if inserted {
+            crate::engine::detail::store_body(self, id, &raw)?;
+            self.changed(Some(&acc.id));
+        }
+        Ok(id)
+    }
+
+    /// Seven days of plausible usage (replaces earlier demo rows of those days).
+    fn ai_demo_usage(&self) {
+        let dates = usage::last_days(7);
+        let rows: [(&str, &str, &str, u64, u64, u64); 5] = [
+            ("claude_code", "default", "compose", 4, 1800, 900),
+            ("claude_code", "default", "summary", 6, 5200, 700),
+            ("claude_code", "default", "insight", 9, 7400, 600),
+            ("deepseek", "deepseek-chat", "ask", 2, 3100, 500),
+            ("deepseek", "deepseek-chat", "loop", 1, 2600, 800),
+        ];
+        for (i, date) in dates.iter().enumerate() {
+            let day = i as u64 + 1;
+            for (provider, model, feature, calls, input, output) in rows {
+                let key = usage::row_key(date, provider, model, feature);
+                let _ = self.db.kv_delete(usage::SPACE, &key);
+                let n = calls + (day * 7 + calls) % 4;
+                let tokens = TokenUsage { input_tokens: input * n / calls, output_tokens: output * n / calls };
+                self.ai_add_usage(date, provider, model, feature, n, tokens, 1200 * n, false);
+            }
+        }
     }
 }

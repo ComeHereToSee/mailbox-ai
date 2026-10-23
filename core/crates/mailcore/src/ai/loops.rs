@@ -1,7 +1,7 @@
 //! Loops: scheduled AI tasks over a search (kv spaces `ai_loop` and `ai_loop_run`).
 
 use super::model::{AiLoop, LoopRun, LoopSchedule, ModelRef};
-use super::{clean_output, fmt_time, local_tz, markdown_to_html, preview_text, prompts};
+use super::{clean_output, fmt_time, local_tz, markdown_to_html, policy, preview_text, prompts};
 use crate::Engine;
 use crate::error::{Error, Result};
 use crate::events::Event;
@@ -332,7 +332,8 @@ impl Engine {
         Ok(out)
     }
 
-    /// (message count, Markdown output). No messages: no model call.
+    /// (message count, Markdown output). No messages: no model call. Messages of accounts
+    /// whose AI policy keeps them from the model are left out.
     async fn ai_loop_output(&self, l: &AiLoop) -> Result<(usize, String)> {
         let s = self.ai_settings();
         let limit = l.max_messages.clamp(1, 200);
@@ -341,6 +342,11 @@ impl Engine {
             return Ok((0, NO_MATCH.to_string()));
         }
         let model = self.ai_loop_model(l)?;
+        let local = self.ai_model_is_local(&model);
+        let msgs: Vec<MessageSummary> = msgs.into_iter().filter(|m| policy::allows(&s, &m.account_id, local)).collect();
+        if msgs.is_empty() {
+            return Ok((0, NO_MATCH.to_string()));
+        }
         let labels: HashMap<String, String> = self.db.accounts()?.into_iter().map(|a| (a.id, a.label)).collect();
         let with_body = msgs.len() <= 10;
         let mut list = String::new();
@@ -360,14 +366,14 @@ impl Engine {
                 m.snippet
             ));
             if with_body {
-                if let Ok(t) = self.ai_mail_text(m.id, 1500, true).await {
+                if let Ok(t) = self.ai_mail_text(m.id, 1500, true, local).await {
                     list.push_str(&format!("正文：{}\n", t.text));
                 }
             }
             list.push('\n');
         }
         let (system, user) = prompts::loop_run(&s, l, &list, msgs.len());
-        let text = self.ai_complete(&model, system, user, false, None).await?;
+        let text = self.ai_complete(&model, "loop", system, user, false, None).await?;
         Ok((msgs.len(), clean_output(&text)))
     }
 

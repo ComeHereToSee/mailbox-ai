@@ -62,7 +62,7 @@ pub(super) async fn process(e: &Engine, acc: &Account, mut conn: Option<&mut Ima
             continue;
         }
         let summary = e.db.message(*id).map(|m| m.summary).unwrap_or(m.summary);
-        e.notify_message(&summary, out.notify).await;
+        e.notify_new_message(&summary, out.notify).await;
         // Smart reminders / auto replies run in a background queue (never blocks sync).
         e.ai_enqueue(*id);
     }
@@ -121,6 +121,16 @@ impl Engine {
 
     /// Decides whether a message deserves a notification and announces it.
     pub(crate) async fn notify_message(&self, summary: &MessageSummary, rule_override: Option<bool>) {
+        self.announce_message(summary, rule_override, false);
+    }
+
+    /// New inbox mail: like [`Engine::notify_message`], but in the AI "important" mode the
+    /// notification waits for the smart analysis (`ai_notify` event later).
+    pub(crate) async fn notify_new_message(&self, summary: &MessageSummary, rule_override: Option<bool>) {
+        self.announce_message(summary, rule_override, true);
+    }
+
+    fn announce_message(&self, summary: &MessageSummary, rule_override: Option<bool>, may_hold: bool) {
         let Ok(acc) = self.db.account(&summary.account_id) else { return };
         let settings = self.settings();
         let prefs = &acc.config.notify;
@@ -139,17 +149,23 @@ impl Engine {
         if (paused || in_quiet_hours(&settings.quiet_hours, chrono::Local::now())) && !vip {
             notify = false;
         }
+        let held = notify && may_hold && self.ai_hold_notification(summary.id);
         self.events.emit(Event::NewMail {
             account_id: acc.id.clone(),
             account_label: acc.label.clone(),
             account_color: acc.color.clone(),
             message: summary.clone(),
-            notify,
+            notify: notify && !held,
             sound: prefs.sound,
         });
-        if !notify {
+        if !notify || held {
             return;
         }
+        self.forward_notification(&acc, summary, vip);
+    }
+
+    /// Sends a notified message to the configured forwarders (Bark, webhooks …).
+    pub(crate) fn forward_notification(&self, acc: &Account, summary: &MessageSummary, vip: bool) {
         let forwarders: Vec<Forwarder> = self.db.kv_list("forwarders").unwrap_or_default();
         if forwarders.is_empty() {
             return;

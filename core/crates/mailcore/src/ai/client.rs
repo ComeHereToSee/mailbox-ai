@@ -1,5 +1,7 @@
 //! HTTP providers: OpenAI compatible, Anthropic, Gemini and Azure OpenAI, streamed as SSE
-//! and read with `Response::chunk()`.
+//! and read with `Response::chunk()`. Several API keys can be configured per provider:
+//! requests take them in turn and a key rejected with 401 / 403 / 429 is retried once
+//! with the next one.
 
 use super::model::*;
 use super::providers;
@@ -10,16 +12,22 @@ use tokio::sync::mpsc;
 
 /// Longest silence allowed between two chunks of a response (and before the headers).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Non-streaming calls (tool loops, embeddings) get the whole answer at once.
+const WHOLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Collects the generated text and forwards each delta to the stream (if any).
 pub(crate) struct Sink {
     pub text: String,
     tx: Option<mpsc::Sender<String>>,
+    /// Tokens reported by the provider.
+    pub usage: TokenUsage,
+    /// The provider refused `stream_options` (OpenAI compatible servers): do not send it again.
+    pub stream_options_rejected: bool,
 }
 
 impl Sink {
     pub fn new(tx: Option<mpsc::Sender<String>>) -> Sink {
-        Sink { text: String::new(), tx }
+        Sink { text: String::new(), tx, usage: TokenUsage::default(), stream_options_rejected: false }
     }
 
     pub async fn push(&mut self, s: &str) {
@@ -31,6 +39,41 @@ impl Sink {
             let _ = tx.send(s.to_string()).await;
         }
     }
+}
+
+/// The API keys of a provider and where this request starts in the rotation.
+#[derive(Clone, Copy, Debug)]
+pub struct Keys<'a> {
+    list: &'a [String],
+    start: usize,
+}
+
+impl<'a> Keys<'a> {
+    pub fn new(list: &'a [String], start: usize) -> Keys<'a> {
+        Keys { list, start }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// The key of attempt `n` (0 = first try, 1 = the retry with the next key). The retry
+    /// needs a second key.
+    pub fn get(&self, n: usize) -> Option<&'a str> {
+        if self.list.is_empty() || (n > 0 && self.list.len() < 2) {
+            return None;
+        }
+        let len = self.list.len();
+        Some(self.list[(self.start % len + n) % len].as_str())
+    }
+}
+
+/// Result of a streamed chat call.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOutput {
+    pub text: String,
+    pub usage: TokenUsage,
+    pub stream_options_rejected: bool,
 }
 
 // ---- SSE ----------------------------------------------------------------------------------
@@ -160,6 +203,27 @@ fn azure_version(p: &AiProvider) -> String {
     p.api_version.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "2024-10-21".into())
 }
 
+/// Chat endpoint of a provider (`stream`: Gemini's SSE variant).
+pub(crate) fn chat_url(p: &AiProvider, model: &str, stream: bool) -> Result<String> {
+    let b = base(p)?;
+    Ok(match p.kind {
+        ProviderKind::AzureOpenai => {
+            format!("{b}/openai/deployments/{model}/chat/completions?api-version={}", azure_version(p))
+        }
+        ProviderKind::Anthropic => format!("{}/v1/messages", strip_version(&b, "/v1")),
+        ProviderKind::Gemini => {
+            let m = model.trim().trim_start_matches("models/");
+            let root = strip_version(&b, "/v1beta");
+            if stream {
+                format!("{root}/v1beta/models/{m}:streamGenerateContent?alt=sse")
+            } else {
+                format!("{root}/v1beta/models/{m}:generateContent")
+            }
+        }
+        _ => format!("{b}/chat/completions"),
+    })
+}
+
 fn auth(mut b: reqwest::RequestBuilder, p: &AiProvider, key: Option<&str>) -> reqwest::RequestBuilder {
     let key = key.map(str::trim).filter(|k| !k.is_empty());
     match p.kind {
@@ -188,12 +252,28 @@ fn auth(mut b: reqwest::RequestBuilder, p: &AiProvider, key: Option<&str>) -> re
     b
 }
 
-async fn send(b: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-    match tokio::time::timeout(IDLE_TIMEOUT, b.send()).await {
-        Err(_) => Err(Error::Ai("AI 服务超过 120 秒没有响应".into())),
+async fn send(b: reqwest::RequestBuilder, wait: Duration) -> Result<reqwest::Response> {
+    match tokio::time::timeout(wait, b.send()).await {
+        Err(_) => Err(Error::Ai(format!("AI 服务超过 {} 秒没有响应", wait.as_secs()))),
         Ok(Err(e)) => Err(Error::Net(format!("无法连接 AI 服务：{e}"))),
         Ok(Ok(r)) => Ok(r),
     }
+}
+
+/// Sends with the first key of the rotation; on 401 / 403 / 429 once more with the next key.
+async fn send_keyed<F>(p: &AiProvider, keys: Keys<'_>, wait: Duration, make: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let resp = send(auth(make(), p, keys.get(0)), wait).await?;
+    let status = resp.status().as_u16();
+    if matches!(status, 401 | 403 | 429) {
+        if let Some(next) = keys.get(1) {
+            tracing::debug!(provider = %p.id, status, "ai key rejected, retrying with the next key");
+            return send(auth(make(), p, Some(next)), wait).await;
+        }
+    }
+    Ok(resp)
 }
 
 async fn next_chunk(resp: &mut reqwest::Response) -> Result<Option<Vec<u8>>> {
@@ -263,40 +343,73 @@ fn is_json_response(resp: &reqwest::Response) -> bool {
 
 // ---- chat ---------------------------------------------------------------------------------
 
-/// Runs a chat request against an HTTP provider; deltas go to `tx`, the full text is returned.
+/// Runs a chat request against an HTTP provider; deltas go to `tx`, the full text and the
+/// token usage are returned. `stream_options`: ask OpenAI compatible servers for usage.
 pub async fn chat(
     http: &reqwest::Client,
     p: &AiProvider,
-    key: Option<&str>,
+    keys: Keys<'_>,
+    stream_options: bool,
     req: &ChatRequest,
     tx: Option<mpsc::Sender<String>>,
-) -> Result<String> {
-    let key = key.map(str::trim).filter(|k| !k.is_empty());
-    if key.is_none() && needs_key(p) {
+) -> Result<ChatOutput> {
+    if keys.is_empty() && needs_key(p) {
         return Err(Error::AiNotConfigured(format!("{} 还没有填写 API Key：请在 设置 → AI 服务 中填写", p.name)));
     }
     let mut sink = Sink::new(tx);
     match p.kind {
-        ProviderKind::Openai | ProviderKind::AzureOpenai => openai(http, p, key, req, &mut sink).await?,
-        ProviderKind::Anthropic => anthropic(http, p, key, req, &mut sink).await?,
-        ProviderKind::Gemini => gemini(http, p, key, req, &mut sink).await?,
+        ProviderKind::Openai | ProviderKind::AzureOpenai => openai(http, p, keys, stream_options, req, &mut sink).await?,
+        ProviderKind::Anthropic => anthropic(http, p, keys, req, &mut sink).await?,
+        ProviderKind::Gemini => gemini(http, p, keys, req, &mut sink).await?,
         ProviderKind::ClaudeCode | ProviderKind::Codex => return Err(Error::Invalid("命令行服务商不走 HTTP".into())),
     }
     if sink.text.trim().is_empty() {
         return Err(Error::Ai("AI 没有返回任何内容".into()));
     }
-    Ok(sink.text)
+    Ok(ChatOutput { text: sink.text, usage: sink.usage, stream_options_rejected: sink.stream_options_rejected })
 }
 
-async fn openai(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: &ChatRequest, sink: &mut Sink) -> Result<()> {
+/// Index of the message the images go with (the last user message).
+fn image_target(msgs: &[ChatMessage], req: &ChatRequest) -> Option<usize> {
+    if req.images.is_empty() {
+        return None;
+    }
+    msgs.iter().rposition(|m| m.role != "assistant")
+}
+
+fn openai_usage(u: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+        output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+    }
+}
+
+async fn openai(
+    http: &reqwest::Client,
+    p: &AiProvider,
+    keys: Keys<'_>,
+    stream_options: bool,
+    req: &ChatRequest,
+    sink: &mut Sink,
+) -> Result<()> {
     let (system, msgs) = split_system(req);
+    let target = image_target(&msgs, req);
     let mut messages: Vec<Value> = Vec::new();
     if let Some(s) = &system {
         messages.push(json!({ "role": "system", "content": s }));
     }
-    for m in &msgs {
+    for (i, m) in msgs.iter().enumerate() {
         let role = if m.role == "assistant" { "assistant" } else { "user" };
-        messages.push(json!({ "role": role, "content": m.content }));
+        if target == Some(i) {
+            let mut parts: Vec<Value> = vec![json!({ "type": "text", "text": m.content })];
+            for img in &req.images {
+                let url = format!("data:{};base64,{}", img.media_type, img.data);
+                parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+            }
+            messages.push(json!({ "role": role, "content": parts }));
+        } else {
+            messages.push(json!({ "role": role, "content": m.content }));
+        }
     }
     let mut body = json!({ "model": req.model.model, "messages": messages, "stream": true });
     if let Some(t) = req.temperature {
@@ -308,19 +421,27 @@ async fn openai(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: 
     if req.json {
         body["response_format"] = json!({ "type": "json_object" });
     }
-    let b = base(p)?;
-    let url = if p.kind == ProviderKind::AzureOpenai {
-        format!("{b}/openai/deployments/{}/chat/completions?api-version={}", req.model.model, azure_version(p))
-    } else {
-        format!("{b}/chat/completions")
-    };
-    let mut resp = send(auth(http.post(url.as_str()).json(&body), p, key)).await?;
+    if stream_options {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    let url = chat_url(p, &req.model.model, true)?;
+    let mut resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.post(url.as_str()).json(&body)).await?;
     if resp.status().as_u16() == 400 && req.json {
         // Not every compatible server knows `response_format`: retry once without it.
         if let Some(obj) = body.as_object_mut() {
             obj.remove("response_format");
         }
-        resp = send(auth(http.post(url.as_str()).json(&body), p, key)).await?;
+        resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.post(url.as_str()).json(&body)).await?;
+    }
+    if resp.status().as_u16() == 400 && stream_options {
+        // Nor `stream_options`: retry without it and remember (see `Sink`).
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+        resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.post(url.as_str()).json(&body)).await?;
+        if resp.status().is_success() {
+            sink.stream_options_rejected = true;
+        }
     }
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
@@ -330,6 +451,9 @@ async fn openai(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: 
         let v: Value = resp.json().await.map_err(|e| Error::Ai(format!("无法解析 AI 响应：{e}")))?;
         if let Some(err) = v.get("error") {
             return Err(Error::Ai(format!("AI 服务返回错误：{}", error_text(err))));
+        }
+        if v["usage"].is_object() {
+            sink.usage = openai_usage(&v["usage"]);
         }
         if let Some(t) = v.pointer("/choices/0/message/content").and_then(|c| c.as_str()) {
             sink.push(t).await;
@@ -367,6 +491,10 @@ async fn openai_event(ev: &SseEvent, sink: &mut Sink) -> Result<bool> {
     if let Some(err) = v.get("error") {
         return Err(Error::Ai(format!("AI 服务返回错误：{}", error_text(err))));
     }
+    if v["usage"].is_object() {
+        // With `stream_options.include_usage` the last chunk carries the totals.
+        sink.usage = openai_usage(&v["usage"]);
+    }
     // `reasoning_content` (DeepSeek & co.) is ignored on purpose.
     if let Some(t) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
         sink.push(t).await;
@@ -374,12 +502,30 @@ async fn openai_event(ev: &SseEvent, sink: &mut Sink) -> Result<bool> {
     Ok(false)
 }
 
-async fn anthropic(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: &ChatRequest, sink: &mut Sink) -> Result<()> {
+fn anthropic_usage(u: &Value) -> TokenUsage {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    TokenUsage {
+        input_tokens: n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens"),
+        output_tokens: n("output_tokens"),
+    }
+}
+
+async fn anthropic(http: &reqwest::Client, p: &AiProvider, keys: Keys<'_>, req: &ChatRequest, sink: &mut Sink) -> Result<()> {
     let (system, msgs) = split_system(req);
+    let target = image_target(&msgs, req);
     let mut messages: Vec<Value> = Vec::new();
-    for m in &msgs {
+    for (i, m) in msgs.iter().enumerate() {
         let role = if m.role == "assistant" { "assistant" } else { "user" };
-        messages.push(json!({ "role": role, "content": m.content }));
+        if target == Some(i) {
+            let mut parts: Vec<Value> = Vec::new();
+            for img in &req.images {
+                parts.push(json!({ "type": "image", "source": { "type": "base64", "media_type": img.media_type, "data": img.data } }));
+            }
+            parts.push(json!({ "type": "text", "text": m.content }));
+            messages.push(json!({ "role": role, "content": parts }));
+        } else {
+            messages.push(json!({ "role": role, "content": m.content }));
+        }
     }
     let mut body = json!({
         "model": req.model.model,
@@ -390,8 +536,8 @@ async fn anthropic(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, re
     if let Some(s) = system {
         body["system"] = json!(s);
     }
-    let url = format!("{}/v1/messages", strip_version(&base(p)?, "/v1"));
-    let mut resp = send(auth(http.post(url.as_str()).json(&body), p, key)).await?;
+    let url = chat_url(p, &req.model.model, true)?;
+    let mut resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.post(url.as_str()).json(&body)).await?;
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
     }
@@ -399,6 +545,9 @@ async fn anthropic(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, re
         let v: Value = resp.json().await.map_err(|e| Error::Ai(format!("无法解析 AI 响应：{e}")))?;
         if let Some(err) = v.get("error") {
             return Err(Error::Ai(format!("AI 服务返回错误：{}", error_text(err))));
+        }
+        if v["usage"].is_object() {
+            sink.usage = anthropic_usage(&v["usage"]);
         }
         for part in v["content"].as_array().into_iter().flatten() {
             if part["type"] == "text" {
@@ -448,9 +597,21 @@ async fn anthropic_event(ev: &SseEvent, sink: &mut Sink, state: &mut AnthropicSt
                 }
             }
         }
+        "message_start" => {
+            if v["message"]["usage"].is_object() {
+                sink.usage = anthropic_usage(&v["message"]["usage"]);
+            }
+        }
         "message_delta" => {
             if v["delta"]["stop_reason"] == "refusal" {
                 state.refused = true;
+            }
+            // Cumulative counts; input tokens only in newer API versions.
+            if let Some(out) = v["usage"]["output_tokens"].as_u64() {
+                sink.usage.output_tokens = out;
+            }
+            if let Some(input) = v["usage"]["input_tokens"].as_u64().filter(|n| *n > 0) {
+                sink.usage.input_tokens = input;
             }
         }
         "message_stop" => state.stopped = true,
@@ -460,12 +621,19 @@ async fn anthropic_event(ev: &SseEvent, sink: &mut Sink, state: &mut AnthropicSt
     Ok(())
 }
 
-async fn gemini(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: &ChatRequest, sink: &mut Sink) -> Result<()> {
+async fn gemini(http: &reqwest::Client, p: &AiProvider, keys: Keys<'_>, req: &ChatRequest, sink: &mut Sink) -> Result<()> {
     let (system, msgs) = split_system(req);
+    let target = image_target(&msgs, req);
     let mut contents: Vec<Value> = Vec::new();
-    for m in &msgs {
+    for (i, m) in msgs.iter().enumerate() {
         let role = if m.role == "assistant" { "model" } else { "user" };
-        contents.push(json!({ "role": role, "parts": [{ "text": m.content }] }));
+        let mut parts: Vec<Value> = vec![json!({ "text": m.content })];
+        if target == Some(i) {
+            for img in &req.images {
+                parts.push(json!({ "inlineData": { "mimeType": img.media_type, "data": img.data } }));
+            }
+        }
+        contents.push(json!({ "role": role, "parts": parts }));
     }
     let mut body = json!({ "contents": contents });
     if let Some(s) = system {
@@ -484,9 +652,8 @@ async fn gemini(http: &reqwest::Client, p: &AiProvider, key: Option<&str>, req: 
     if !config.is_empty() {
         body["generationConfig"] = Value::Object(config);
     }
-    let model = req.model.model.trim().trim_start_matches("models/");
-    let url = format!("{}/v1beta/models/{model}:streamGenerateContent?alt=sse", strip_version(&base(p)?, "/v1beta"));
-    let mut resp = send(auth(http.post(url.as_str()).json(&body), p, key)).await?;
+    let url = chat_url(p, &req.model.model, true)?;
+    let mut resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.post(url.as_str()).json(&body)).await?;
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
     }
@@ -521,6 +688,9 @@ async fn gemini_event(ev: &SseEvent, sink: &mut Sink, blocked: &mut Option<Strin
     if let Some(reason) = v.pointer("/promptFeedback/blockReason").and_then(|r| r.as_str()) {
         *blocked = Some(reason.to_string());
     }
+    if v["usageMetadata"].is_object() {
+        sink.usage = gemini_usage(&v["usageMetadata"]);
+    }
     let mut text = String::new();
     for part in v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()).into_iter().flatten() {
         if part["thought"] == true {
@@ -534,11 +704,83 @@ async fn gemini_event(ev: &SseEvent, sink: &mut Sink, blocked: &mut Option<Strin
     Ok(())
 }
 
+fn gemini_usage(u: &Value) -> TokenUsage {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    TokenUsage { input_tokens: n("promptTokenCount"), output_tokens: n("candidatesTokenCount") + n("thoughtsTokenCount") }
+}
+
+// ---- non-streaming calls ------------------------------------------------------------------
+
+/// POSTs a JSON body (key rotation included) and returns the JSON answer.
+pub(crate) async fn post_json(http: &reqwest::Client, p: &AiProvider, keys: Keys<'_>, url: &str, body: &Value) -> Result<Value> {
+    if keys.is_empty() && needs_key(p) {
+        return Err(Error::AiNotConfigured(format!("{} 还没有填写 API Key：请在 设置 → AI 服务 中填写", p.name)));
+    }
+    let resp = send_keyed(p, keys, WHOLE_TIMEOUT, || http.post(url).json(body)).await?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp).await);
+    }
+    let v: Value = match tokio::time::timeout(WHOLE_TIMEOUT, resp.json::<Value>()).await {
+        Err(_) => return Err(Error::Ai("AI 服务超过 300 秒没有返回结果".into())),
+        Ok(Err(e)) => return Err(Error::Ai(format!("无法解析 AI 响应：{e}"))),
+        Ok(Ok(v)) => v,
+    };
+    let err = match v.as_array() {
+        Some(list) => list.first().and_then(|x| x.get("error")).cloned(),
+        None => v.get("error").cloned(),
+    };
+    if let Some(err) = err.filter(|e| !e.is_null()) {
+        return Err(Error::Ai(format!("AI 服务返回错误：{}", error_text(&err))));
+    }
+    Ok(v)
+}
+
+fn floats(v: &Value) -> Vec<f32> {
+    v.as_array().into_iter().flatten().filter_map(|x| x.as_f64()).map(|x| x as f32).collect()
+}
+
+/// Whether `embed` supports the provider (OpenAI compatible, Azure, Gemini).
+pub fn supports_embeddings(p: &AiProvider) -> bool {
+    matches!(p.kind, ProviderKind::Openai | ProviderKind::AzureOpenai | ProviderKind::Gemini)
+}
+
+/// Embedding vectors of `inputs` (same order).
+pub(crate) async fn embed(http: &reqwest::Client, p: &AiProvider, keys: Keys<'_>, model: &str, inputs: &[String]) -> Result<(Vec<Vec<f32>>, TokenUsage)> {
+    let b = base(p)?;
+    match p.kind {
+        ProviderKind::Openai | ProviderKind::AzureOpenai => {
+            let url = if p.kind == ProviderKind::AzureOpenai {
+                format!("{b}/openai/deployments/{model}/embeddings?api-version={}", azure_version(p))
+            } else {
+                format!("{b}/embeddings")
+            };
+            let v = post_json(http, p, keys, &url, &json!({ "model": model, "input": inputs })).await?;
+            let mut rows: Vec<(usize, Vec<f32>)> = Vec::new();
+            for (i, d) in v["data"].as_array().into_iter().flatten().enumerate() {
+                let index = d["index"].as_u64().map(|x| x as usize).unwrap_or(i);
+                rows.push((index, floats(&d["embedding"])));
+            }
+            rows.sort_by_key(|r| r.0);
+            let usage = TokenUsage { input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0), output_tokens: 0 };
+            Ok((rows.into_iter().map(|r| r.1).collect(), usage))
+        }
+        ProviderKind::Gemini => {
+            let m = model.trim().trim_start_matches("models/");
+            let url = format!("{}/v1beta/models/{m}:batchEmbedContents", strip_version(&b, "/v1beta"));
+            let requests: Vec<Value> =
+                inputs.iter().map(|t| json!({ "model": format!("models/{m}"), "content": { "parts": [{ "text": t }] } })).collect();
+            let v = post_json(http, p, keys, &url, &json!({ "requests": requests })).await?;
+            let out: Vec<Vec<f32>> = v["embeddings"].as_array().into_iter().flatten().map(|e| floats(&e["values"])).collect();
+            Ok((out, TokenUsage::default()))
+        }
+        _ => Err(Error::Invalid(format!("{} 不支持嵌入模型", p.name))),
+    }
+}
+
 // ---- model lists --------------------------------------------------------------------------
 
 /// `POST /v1/ai/providers/{id}/models` for HTTP providers.
-pub async fn list_models(http: &reqwest::Client, p: &AiProvider, key: Option<&str>) -> Result<Vec<AiModel>> {
-    let key = key.map(str::trim).filter(|k| !k.is_empty());
+pub async fn list_models(http: &reqwest::Client, p: &AiProvider, keys: Keys<'_>) -> Result<Vec<AiModel>> {
     let b = base(p)?;
     let url = match p.kind {
         ProviderKind::Anthropic => format!("{}/v1/models?limit=1000", strip_version(&b, "/v1")),
@@ -546,7 +788,7 @@ pub async fn list_models(http: &reqwest::Client, p: &AiProvider, key: Option<&st
         ProviderKind::AzureOpenai => format!("{b}/openai/models?api-version={}", azure_version(p)),
         _ => format!("{b}/models"),
     };
-    let resp = send(auth(http.get(url.as_str()).timeout(Duration::from_secs(30)), p, key)).await?;
+    let resp = send_keyed(p, keys, IDLE_TIMEOUT, || http.get(url.as_str()).timeout(Duration::from_secs(30))).await?;
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
     }
@@ -633,6 +875,20 @@ mod tests {
         assert_eq!(error_detail(&v).as_deref(), Some("model not found"));
         let v: Value = serde_json::from_str(r#"[{"error":{"code":400,"message":"bad"}}]"#).unwrap();
         assert_eq!(error_detail(&v).as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn keys_rotate() {
+        let list = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let k = Keys::new(&list, 4);
+        assert_eq!((k.get(0), k.get(1)), (Some("b"), Some("c")));
+        let one = vec!["only".to_string()];
+        let k = Keys::new(&one, 7);
+        assert_eq!((k.get(0), k.get(1)), (Some("only"), None));
+        let none: Vec<String> = Vec::new();
+        assert!(Keys::new(&none, 0).get(0).is_none());
+        assert_eq!(openai_usage(&json!({"prompt_tokens": 11, "completion_tokens": 7})), TokenUsage { input_tokens: 11, output_tokens: 7 });
+        assert_eq!(anthropic_usage(&json!({"input_tokens": 3, "cache_read_input_tokens": 2, "output_tokens": 1})).input_tokens, 5);
     }
 
     #[test]

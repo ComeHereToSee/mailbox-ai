@@ -1,5 +1,6 @@
 //! Provider presets and the stored provider list (kv space `ai_provider`). API keys live in
-//! the encrypted secrets file under `ai:key:<provider_id>` and are never returned.
+//! the encrypted secrets file under `ai:key:<provider_id>` and are never returned. Several
+//! keys may be stored (comma or newline separated); requests take them in turn.
 
 use super::model::*;
 use super::{client, truncate_plain};
@@ -12,6 +13,8 @@ use std::time::Duration;
 const SPACE: &str = "ai_provider";
 /// kv sort value of custom providers (after every preset).
 const CUSTOM_SORT: i64 = 1000;
+/// kv `ai` id: capabilities of the models stored by an older version were inferred once.
+const CAPABILITIES_FLAG: &str = "capabilities_inferred";
 
 static PRESETS: LazyLock<Vec<ProviderPreset>> = LazyLock::new(|| match serde_json::from_str(include_str!("presets.json")) {
     Ok(p) => p,
@@ -34,6 +37,11 @@ pub fn key_name(provider_id: &str) -> String {
     format!("ai:key:{provider_id}")
 }
 
+/// The keys of a stored `api_key` value (English commas or line breaks between them).
+pub fn split_keys(s: &str) -> Vec<String> {
+    s.split([',', '\n', '\r']).map(str::trim).filter(|k| !k.is_empty()).map(String::from).collect()
+}
+
 /// Default provider entry of a preset.
 pub fn from_preset(p: &ProviderPreset) -> AiProvider {
     AiProvider {
@@ -46,6 +54,7 @@ pub fn from_preset(p: &ProviderPreset) -> AiProvider {
         models: p.models.iter().map(|m| AiModel::new(m)).collect(),
         has_key: false,
         custom: false,
+        key_count: 0,
     }
 }
 
@@ -57,7 +66,10 @@ impl Engine {
     /// Every provider: presets in preset order, then custom ones. Missing presets are
     /// created from their defaults (first launch, or a preset added by an update).
     pub fn ai_providers(&self) -> Vec<AiProvider> {
-        let stored: Vec<AiProvider> = self.db.kv_list(SPACE).unwrap_or_default();
+        let mut stored: Vec<AiProvider> = self.db.kv_list(SPACE).unwrap_or_default();
+        if !self.db.kv_get::<bool>("ai", CAPABILITIES_FLAG).ok().flatten().unwrap_or(false) {
+            self.ai_infer_stored_capabilities(&mut stored);
+        }
         let mut out: Vec<AiProvider> = Vec::new();
         for (i, p) in presets().iter().enumerate() {
             match stored.iter().find(|s| s.id == p.id) {
@@ -84,9 +96,49 @@ impl Engine {
             }
         }
         for p in out.iter_mut() {
-            p.has_key = self.secrets.get(&key_name(&p.id)).is_some_and(|k| !k.trim().is_empty());
+            p.key_count = self.ai_key_list(&p.id).len();
+            p.has_key = p.key_count > 0;
         }
         out
+    }
+
+    /// One-time upgrade: models stored before capabilities existed get them inferred.
+    fn ai_infer_stored_capabilities(&self, stored: &mut [AiProvider]) {
+        for p in stored.iter_mut() {
+            let mut changed = false;
+            for m in p.models.iter_mut() {
+                if m.capabilities.is_empty() {
+                    let caps = infer_capabilities(&m.id);
+                    if !caps.is_empty() {
+                        m.capabilities = caps;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let sort = preset_index(&p.id).map(|i| i as i64).unwrap_or(CUSTOM_SORT);
+                if let Err(err) = self.db.kv_put(SPACE, &p.id, &*p, sort) {
+                    tracing::warn!(error = %err, "could not store ai provider");
+                }
+            }
+        }
+        if let Err(err) = self.db.kv_put("ai", CAPABILITIES_FLAG, &true, 0) {
+            tracing::warn!(error = %err, "could not store ai flag");
+        }
+    }
+
+    /// The API keys of a provider (empty when none is stored).
+    pub(crate) fn ai_key_list(&self, provider_id: &str) -> Vec<String> {
+        self.secrets.get(&key_name(provider_id)).map(|s| split_keys(&s)).unwrap_or_default()
+    }
+
+    /// Where the next request of a provider starts in its key rotation.
+    pub(crate) fn ai_next_key(&self, provider_id: &str) -> usize {
+        let mut cursors = self.ai.key_cursor.lock();
+        let c = cursors.entry(provider_id.to_string()).or_insert(0);
+        let start = *c;
+        *c = c.wrapping_add(1);
+        start
     }
 
     pub fn ai_provider(&self, id: &str) -> Option<AiProvider> {
@@ -135,10 +187,19 @@ impl Engine {
             if m.group.is_empty() {
                 m.group = model_group(&m.id);
             }
+            // A model added by hand gets its capabilities guessed; known ones keep the
+            // user's choice (which may be "none").
+            let known = existing.as_ref().is_some_and(|e| e.models.iter().any(|x| x.id == m.id));
+            if !known && m.capabilities.is_empty() {
+                m.capabilities = infer_capabilities(&m.id);
+            }
+            m.capabilities.retain(|c| matches!(c.as_str(), "vision" | "reasoning" | "tools" | "embedding"));
+            m.capabilities.dedup();
             models.push(m);
         }
         p.models = models;
         p.has_key = false;
+        p.key_count = 0;
         match input.api_key.as_deref().map(str::trim) {
             Some("") => self.secrets.remove(&key_name(id))?,
             Some(k) => self.secrets.set(&key_name(id), k)?,
@@ -175,8 +236,9 @@ impl Engine {
             };
             return Ok(models);
         }
-        let key = self.secrets.get(&key_name(id));
-        client::list_models(&self.ai.http, &p, key.as_deref()).await
+        let keys = self.ai_key_list(id);
+        let start = self.ai_next_key(id);
+        client::list_models(&self.ai.http, &p, client::Keys::new(&keys, start)).await
     }
 
     /// "Check connection": asks the model to answer "OK". → `{ok, latency_ms, reply?, error?}`
@@ -197,6 +259,8 @@ impl Engine {
             temperature: None,
             max_tokens: None,
             json: false,
+            feature: "test".into(),
+            images: Vec::new(),
         };
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(120), self.ai_chat(req, None)).await;
@@ -232,5 +296,14 @@ mod tests {
         assert!(from_preset(preset("ollama").unwrap()).enabled);
         assert!(!from_preset(preset("openai").unwrap()).enabled);
         assert!(from_preset(preset("codex").unwrap()).models.iter().all(|m| m.enabled));
+        let openai = from_preset(preset("openai").unwrap());
+        assert!(openai.models.iter().any(|m| m.capabilities.contains(&"vision".to_string())), "{:?}", openai.models);
+    }
+
+    #[test]
+    fn several_keys() {
+        assert_eq!(split_keys("sk-a, sk-b\nsk-c\r\n\n"), vec!["sk-a", "sk-b", "sk-c"]);
+        assert_eq!(split_keys("  sk-only "), vec!["sk-only"]);
+        assert!(split_keys(" , \n").is_empty());
     }
 }

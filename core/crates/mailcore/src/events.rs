@@ -36,6 +36,12 @@ pub enum Event {
     AiLoop { loop_id: String, run_id: String, name: String, status: String, preview: String },
     /// An auto reply was drafted (`draft_id`) or queued for sending (`sent`).
     AiAutoreply { message_id: i64, rule_name: String, draft_id: Option<String>, sent: bool, subject: String },
+    /// An MCP client wants to send or delete mail: the app and the helper ask the user, who
+    /// answers with `POST /v1/ai/confirm/{id}`.
+    AiConfirm { id: String, kind: String, title: String, detail: String },
+    /// Notification mode "important": a new message worth a notification after the smart
+    /// analysis (or the plain fallback when the analysis failed or took too long).
+    AiNotify { message_id: i64, title: String, subtitle: String, body: String },
 }
 
 #[derive(Clone)]

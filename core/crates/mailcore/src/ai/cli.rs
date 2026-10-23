@@ -23,7 +23,8 @@ fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-fn expand(p: &str) -> PathBuf {
+/// `~/…` → the home directory.
+pub(crate) fn expand(p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => home().join(rest),
         None => PathBuf::from(p),
@@ -71,7 +72,7 @@ fn newest_nvm_bin(root: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-fn is_exec(p: &Path) -> bool {
+pub(crate) fn is_exec(p: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(p) else { return false };
     if !meta.is_file() {
         return false;
@@ -134,8 +135,14 @@ async fn login_shell_lookup(name: &str) -> Option<PathBuf> {
 
 /// PATH for the child: its own directory, the install directories, then the system PATH.
 fn child_path(exe: &Path) -> String {
+    search_path(exe.parent())
+}
+
+/// `first` (when given), the install directories, the system PATH and the usual system
+/// directories, without duplicates.
+pub(crate) fn search_path(first: Option<&Path>) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = exe.parent() {
+    if let Some(d) = first.filter(|d| !d.as_os_str().is_empty()) {
         parts.push(d.to_string_lossy().to_string());
     }
     for d in candidate_dirs() {
@@ -236,18 +243,82 @@ fn model_arg(model: &str) -> Option<String> {
 
 // ---- Claude Code --------------------------------------------------------------------------
 
-pub async fn claude_chat(e: &Engine, p: &AiProvider, req: &ChatRequest, tx: Option<mpsc::Sender<String>>) -> Result<String> {
+/// Result of a command line call.
+#[derive(Debug, Clone, Default)]
+pub struct CliOutput {
+    pub text: String,
+    pub usage: TokenUsage,
+    /// Claude Code with external MCP tools: the tools it called.
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+/// External MCP servers handed to Claude Code (`--mcp-config`).
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeTools {
+    /// JSON file `{"mcpServers": {key: …}}`.
+    pub config_file: PathBuf,
+    /// (key in the config, display name, config id) of every server.
+    pub servers: Vec<(String, String, String)>,
+}
+
+impl ClaudeTools {
+    /// `mcp__<key>__<tool>` → (display name, id, tool); the longest matching key wins.
+    fn resolve(&self, name: &str) -> Option<(String, String, String)> {
+        let rest = name.strip_prefix("mcp__")?;
+        let mut best: Option<&(String, String, String)> = None;
+        for s in &self.servers {
+            let prefix = format!("{}__", s.0);
+            let longer = match best {
+                None => true,
+                Some(b) => s.0.len() > b.0.len(),
+            };
+            if rest.starts_with(&prefix) && longer {
+                best = Some(s);
+            }
+        }
+        let s = best?;
+        Some((s.1.clone(), s.2.clone(), rest[s.0.len() + 2..].to_string()))
+    }
+
+    fn records(&self, uses: &[(String, String, Option<bool>)]) -> Vec<ToolCallRecord> {
+        uses.iter()
+            .filter_map(|(_, name, ok)| {
+                let (server, server_id, tool) = self.resolve(name)?;
+                Some(ToolCallRecord { server, server_id, tool, ok: ok.unwrap_or(false) })
+            })
+            .collect()
+    }
+}
+
+pub async fn claude_chat(
+    e: &Engine,
+    p: &AiProvider,
+    req: &ChatRequest,
+    tx: Option<mpsc::Sender<String>>,
+    tools: Option<&ClaudeTools>,
+) -> Result<CliOutput> {
     let exe = find_cli("claude", &p.base_url).await.ok_or_else(|| not_found("claude", &p.base_url))?;
     let (system, prompt) = flatten(req)?;
     let mut sink = Sink::new(tx);
-    match claude_once(e, &exe, &req.model.model, system.as_deref(), &prompt, true, &mut sink).await? {
-        Some(text) => Ok(text),
+    let mut st = ClaudeRead::default();
+    let run = ClaudeRun { exe: &exe, model: &req.model.model, system: system.as_deref(), prompt: &prompt, partial: true, tools };
+    let text = match claude_once(e, &run, &mut sink, &mut st).await? {
+        Some(text) => text,
         // An older CLI that does not know --include-partial-messages.
-        None => match claude_once(e, &exe, &req.model.model, system.as_deref(), &prompt, false, &mut sink).await? {
-            Some(text) => Ok(text),
-            None => Err(Error::Ai("Claude Code 版本过旧，请更新后再试".into())),
-        },
-    }
+        None => {
+            st = ClaudeRead::default();
+            let run = ClaudeRun { partial: false, ..run };
+            match claude_once(e, &run, &mut sink, &mut st).await? {
+                Some(text) => text,
+                None => return Err(Error::Ai("Claude Code 版本过旧，请更新后再试".into())),
+            }
+        }
+    };
+    let tool_calls = match tools {
+        Some(t) => t.records(&st.tool_uses),
+        None => Vec::new(),
+    };
+    Ok(CliOutput { text, usage: st.usage, tool_calls })
 }
 
 #[derive(Default)]
@@ -257,39 +328,53 @@ struct ClaudeRead {
     result: Option<(bool, String)>,
     /// Non-JSON output, for error messages.
     other: String,
+    usage: TokenUsage,
+    /// (tool_use id, tool name, ok) of the tools called (MCP tools mode).
+    tool_uses: Vec<(String, String, Option<bool>)>,
+}
+
+/// Arguments of one `claude` run.
+#[derive(Clone, Copy)]
+struct ClaudeRun<'a> {
+    exe: &'a Path,
+    model: &'a str,
+    system: Option<&'a str>,
+    prompt: &'a str,
+    partial: bool,
+    tools: Option<&'a ClaudeTools>,
 }
 
 /// One run. `Ok(None)` asks to retry without `--include-partial-messages`.
-async fn claude_once(
-    e: &Engine,
-    exe: &Path,
-    model: &str,
-    system: Option<&str>,
-    prompt: &str,
-    partial: bool,
-    sink: &mut Sink,
-) -> Result<Option<String>> {
+async fn claude_once(e: &Engine, run: &ClaudeRun<'_>, sink: &mut Sink, st: &mut ClaudeRead) -> Result<Option<String>> {
     let mut args: Vec<String> = vec!["-p".into(), "--output-format".into(), "stream-json".into(), "--verbose".into()];
-    if partial {
+    if run.partial {
         args.push("--include-partial-messages".into());
     }
     args.push("--max-turns".into());
-    args.push("1".into());
-    if let Some(m) = model_arg(model) {
+    args.push(if run.tools.is_some() { "8" } else { "1" }.to_string());
+    if let Some(m) = model_arg(run.model) {
         args.push("--model".into());
         args.push(m);
     }
-    if let Some(s) = system.filter(|s| !s.trim().is_empty()) {
+    if let Some(s) = run.system.filter(|s| !s.trim().is_empty()) {
         args.push("--append-system-prompt".into());
         args.push(s.to_string());
     }
+    if let Some(t) = run.tools {
+        args.push("--mcp-config".into());
+        args.push(t.config_file.to_string_lossy().to_string());
+        args.push("--allowedTools".into());
+        for (key, _, _) in &t.servers {
+            args.push(format!("mcp__{key}"));
+        }
+    }
+    // The built-in file and shell tools stay off, also with MCP tools.
     args.push("--disallowedTools".into());
     for t in ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookEdit", "Task"] {
         args.push(t.to_string());
     }
-    let mut sp = spawn(e, exe, &args, prompt)?;
-    let mut st = ClaudeRead::default();
-    let read = read_claude(&mut sp.stdout, sink, &mut st);
+    let mut sp = spawn(e, run.exe, &args, run.prompt)?;
+    let read = read_claude(&mut sp.stdout, sink, st);
     let outcome = tokio::time::timeout(CLI_TIMEOUT, read).await;
     match outcome {
         Err(_) => {
@@ -301,10 +386,10 @@ async fn claude_once(
     let status = sp.child.wait().await?;
     let stderr = sp.stderr.await.unwrap_or_default();
     let output = format!("{}\n{}", st.other, stderr);
-    if partial && st.result.is_none() && sink.text.is_empty() && output.to_lowercase().contains("unknown option") {
+    if run.partial && st.result.is_none() && sink.text.is_empty() && output.to_lowercase().contains("unknown option") {
         return Ok(None);
     }
-    match st.result {
+    match st.result.clone() {
         Some((false, text)) => {
             if sink.text.trim().is_empty() && !text.trim().is_empty() {
                 sink.push(&text).await;
@@ -312,11 +397,25 @@ async fn claude_once(
             if sink.text.trim().is_empty() {
                 return Err(Error::Ai("Claude Code 没有返回内容".into()));
             }
+            // With tools the stream also holds the text of the turns before the tool calls;
+            // the result line is the final answer.
+            if run.tools.is_some() && !text.trim().is_empty() {
+                return Ok(Some(text.trim().to_string()));
+            }
             Ok(Some(sink.text.clone()))
         }
         Some((true, text)) => Err(claude_error(&text, &output)),
         None if status.success() && !sink.text.trim().is_empty() => Ok(Some(sink.text.clone())),
         None => Err(claude_error("", &output)),
+    }
+}
+
+/// `usage` of a Claude Code result line (cache reads and writes count as input).
+fn claude_usage(u: &Value) -> TokenUsage {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    TokenUsage {
+        input_tokens: n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens"),
+        output_tokens: n("output_tokens"),
     }
 }
 
@@ -345,13 +444,26 @@ async fn read_claude(lines: &mut tokio::io::Lines<BufReader<ChildStdout>>, sink:
                 }
             }
             "assistant" => {
-                // Only when partial messages did not stream the text already.
-                if !st.got_delta {
-                    for part in v["message"]["content"].as_array().into_iter().flatten() {
-                        if part["type"] == "text" {
-                            if let Some(text) = part["text"].as_str() {
-                                sink.push(text).await;
-                            }
+                for part in v["message"]["content"].as_array().into_iter().flatten() {
+                    if part["type"] == "tool_use" {
+                        let id = part["id"].as_str().unwrap_or("").to_string();
+                        let name = part["name"].as_str().unwrap_or("").to_string();
+                        st.tool_uses.push((id, name, None));
+                    } else if part["type"] == "text" && !st.got_delta {
+                        // Only when partial messages did not stream the text already.
+                        if let Some(text) = part["text"].as_str() {
+                            sink.push(text).await;
+                        }
+                    }
+                }
+            }
+            "user" => {
+                for part in v["message"]["content"].as_array().into_iter().flatten() {
+                    if part["type"] == "tool_result" {
+                        let id = part["tool_use_id"].as_str().unwrap_or("");
+                        let ok = !part["is_error"].as_bool().unwrap_or(false);
+                        if let Some(u) = st.tool_uses.iter_mut().find(|u| u.0 == id) {
+                            u.2 = Some(ok);
                         }
                     }
                 }
@@ -360,6 +472,9 @@ async fn read_claude(lines: &mut tokio::io::Lines<BufReader<ChildStdout>>, sink:
                 let is_error = v["is_error"].as_bool().unwrap_or(false) || v["subtype"].as_str().is_some_and(|s| s != "success");
                 let text = v["result"].as_str().unwrap_or("").to_string();
                 st.result = Some((is_error, text));
+                if v["usage"].is_object() {
+                    st.usage = claude_usage(&v["usage"]);
+                }
             }
             _ => {}
         }
@@ -382,7 +497,7 @@ fn claude_error(result: &str, output: &str) -> Error {
 
 // ---- Codex --------------------------------------------------------------------------------
 
-pub async fn codex_chat(e: &Engine, p: &AiProvider, req: &ChatRequest, tx: Option<mpsc::Sender<String>>) -> Result<String> {
+pub async fn codex_chat(e: &Engine, p: &AiProvider, req: &ChatRequest, tx: Option<mpsc::Sender<String>>) -> Result<CliOutput> {
     let exe = find_cli("codex", &p.base_url).await.ok_or_else(|| not_found("codex", &p.base_url))?;
     let (system, prompt) = flatten(req)?;
     let input = match system {
@@ -428,10 +543,10 @@ pub async fn codex_chat(e: &Engine, p: &AiProvider, req: &ChatRequest, tx: Optio
         if sink.text.trim().is_empty() {
             sink.push(&last).await;
         }
-        return Ok(last);
+        return Ok(CliOutput { text: last, usage: st.usage, tool_calls: Vec::new() });
     }
     if status.success() && !sink.text.trim().is_empty() {
-        return Ok(sink.text.clone());
+        return Ok(CliOutput { text: sink.text.clone(), usage: st.usage, tool_calls: Vec::new() });
     }
     let output = format!("{}\n{}\n{}", st.errors.join("\n"), st.other, stderr);
     if looks_logged_out(&output) {
@@ -446,6 +561,7 @@ struct CodexRead {
     messages: usize,
     errors: Vec<String>,
     other: String,
+    usage: TokenUsage,
 }
 
 async fn read_codex(lines: &mut tokio::io::Lines<BufReader<ChildStdout>>, sink: &mut Sink, st: &mut CodexRead) -> Result<()> {
@@ -461,6 +577,15 @@ async fn read_codex(lines: &mut tokio::io::Lines<BufReader<ChildStdout>>, sink: 
             }
             continue;
         };
+        // Token counts: {"type":"turn.completed","usage":{…}} or the older
+        // {"msg":{"type":"token_count","info":{"total_token_usage":{…}}}}.
+        let usage = if v["type"] == "turn.completed" { &v["usage"] } else { &v["msg"]["info"]["total_token_usage"] };
+        if usage.is_object() {
+            st.usage = TokenUsage {
+                input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+            };
+        }
         // New format: {"type":"item.completed","item":{"type":"agent_message","text":…}}
         // Old format: {"msg":{"type":"agent_message","message":…}}
         let item = &v["item"];
@@ -560,6 +685,21 @@ mod tests {
         let single = ChatRequest { messages: vec![ChatMessage::user("只有一句")], ..Default::default() };
         assert_eq!(flatten(&single).unwrap().1, "只有一句");
         assert!(flatten(&ChatRequest::default()).is_err());
+    }
+
+    #[test]
+    fn claude_tool_names() {
+        let t = ClaudeTools {
+            config_file: PathBuf::from("/tmp/x.json"),
+            servers: vec![("files".into(), "文件".into(), "1".into()), ("files__x".into(), "X".into(), "2".into())],
+        };
+        assert_eq!(t.resolve("mcp__files__read"), Some(("文件".into(), "1".into(), "read".into())));
+        assert_eq!(t.resolve("mcp__files__x__list"), Some(("X".into(), "2".into(), "list".into())));
+        assert_eq!(t.resolve("Bash"), None);
+        let r = t.records(&[("a".into(), "mcp__files__read".into(), Some(true)), ("b".into(), "mcp__other__y".into(), None)]);
+        assert_eq!(r, vec![ToolCallRecord { server: "文件".into(), server_id: "1".into(), tool: "read".into(), ok: true }]);
+        assert_eq!(claude_usage(&json!({"input_tokens": 3, "cache_read_input_tokens": 4, "output_tokens": 2})), TokenUsage { input_tokens: 7, output_tokens: 2 });
+        assert_eq!(search_path(None).split(':').filter(|d| *d == "/usr/bin").count(), 1);
     }
 
     #[test]

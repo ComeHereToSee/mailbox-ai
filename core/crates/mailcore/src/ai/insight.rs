@@ -68,7 +68,7 @@ fn parse_deadline_local(s: &str) -> Option<i64> {
     }
 }
 
-fn bool_of(v: &Value) -> bool {
+pub(crate) fn bool_of(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         Value::String(s) => matches!(s.trim().to_lowercase().as_str(), "true" | "yes" | "是"),
@@ -77,7 +77,7 @@ fn bool_of(v: &Value) -> bool {
     }
 }
 
-fn text_of(v: &Value) -> Option<String> {
+pub(crate) fn text_of(v: &Value) -> Option<String> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null")).map(String::from)
 }
 
@@ -101,6 +101,8 @@ pub fn parse_insight(v: &Value, message_id: MessageId, now: i64) -> Insight {
         .filter_map(text_of)
         .take(10)
         .collect();
+    let risk = parse_risk(&v["risk"]);
+    let risk_reason = if risk.is_some() { truncate_plain(&text_of(&v["risk_reason"]).unwrap_or_default(), 120) } else { String::new() };
     Insight {
         message_id,
         needs_reply: bool_of(&v["needs_reply"]),
@@ -113,6 +115,21 @@ pub fn parse_insight(v: &Value, message_id: MessageId, now: i64) -> Insight {
         done: false,
         created_at: now,
         reminded: false,
+        events: super::calendar::parse_events_local(&v["events"]),
+        risk,
+        risk_reason,
+    }
+}
+
+/// "phishing" | "scam" from the model's `risk` (anything else: no risk).
+pub fn parse_risk(v: &Value) -> Option<String> {
+    let s = v.as_str().unwrap_or("").trim().to_lowercase();
+    if s.contains("phish") || s.contains("钓鱼") {
+        Some("phishing".to_string())
+    } else if s.contains("scam") || s.contains("fraud") || s.contains("诈骗") || s.contains("欺诈") {
+        Some("scam".to_string())
+    } else {
+        None
     }
 }
 
@@ -136,6 +153,8 @@ pub(crate) fn in_scope(e: &Engine, s: &AiSettings, id: MessageId) -> bool {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct ReminderItem {
+    /// "insight" | "follow_up"
+    pub kind: String,
     pub message: MessageSummary,
     pub account_label: String,
     pub insight: Insight,
@@ -146,17 +165,19 @@ impl Engine {
         self.db.kv_get::<Insight>(SPACE, &id.to_string()).ok().flatten()
     }
 
-    fn ai_put_insight(&self, ins: &Insight) -> Result<()> {
+    pub(crate) fn ai_put_insight(&self, ins: &Insight) -> Result<()> {
         self.db.kv_put(SPACE, &ins.message_id.to_string(), ins, 0)
     }
 
-    /// Analyses a message now (quick model, JSON) and stores the result.
+    /// Analyses a message now (quick model, JSON) and stores the result; the calendar
+    /// entries found go into the `ai_events` cache as well.
     pub async fn ai_analyze(&self, id: MessageId) -> Result<Insight> {
         let s = self.ai_settings();
         let model = self.ai_model(true)?;
-        let mail = self.ai_mail_text(id, s.max_body_chars, true).await?;
+        let local = self.ai_model_is_local(&model);
+        let mail = self.ai_mail_text(id, s.max_body_chars, true, local).await?;
         let (system, user) = prompts::insight(&s, &mail);
-        let v = self.ai_json(&model, system, user).await?;
+        let v = self.ai_json(&model, "insight", system, user).await?;
         let mut ins = parse_insight(&v, id, now());
         if self.db.message(id)?.summary.flags.answered {
             ins.needs_reply = false;
@@ -166,11 +187,15 @@ impl Engine {
             ins.reminded = old.reminded && old.remind_at == ins.remind_at;
         }
         self.ai_put_insight(&ins)?;
+        if let Err(err) = self.ai_store_events(id, &ins.events, &model.label()) {
+            tracing::warn!(error = %err, "could not cache extracted events");
+        }
         self.events.emit(Event::AiInsight { message_id: id });
         Ok(ins)
     }
 
-    /// `GET /v1/ai/reminders`: open items that need a reply, have a deadline or todos.
+    /// `GET /v1/ai/reminders`: open items that need a reply, have a deadline, todos or a
+    /// phishing / scam risk, plus follow-ups of own sent mail (`kind: "follow_up"`).
     /// Deadlines first (soonest first), then the rest by message date, newest first.
     pub fn ai_reminders(&self) -> Result<Vec<ReminderItem>> {
         let labels: HashMap<String, String> = self.db.accounts()?.into_iter().map(|a| (a.id, a.label)).collect();
@@ -187,12 +212,13 @@ impl Engine {
                 ins.needs_reply = false;
                 let _ = self.ai_put_insight(&ins);
             }
-            if !(ins.needs_reply || ins.deadline.is_some() || !ins.todos.is_empty()) {
+            if !(ins.needs_reply || ins.deadline.is_some() || !ins.todos.is_empty() || ins.risk.is_some()) {
                 continue;
             }
             let account_label = labels.get(&m.summary.account_id).cloned().unwrap_or_default();
-            items.push(ReminderItem { message: m.summary, account_label, insight: ins });
+            items.push(ReminderItem { kind: "insight".into(), message: m.summary, account_label, insight: ins });
         }
+        items.extend(super::followup::reminder_items(self, &labels));
         items.sort_by(|a, b| match (a.insight.deadline, b.insight.deadline) {
             (Some(x), Some(y)) => x.cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -202,13 +228,24 @@ impl Engine {
         Ok(items)
     }
 
-    /// `POST /v1/ai/reminders/{message_id}/done`.
+    /// `POST /v1/ai/reminders/{message_id}/done` (smart reminders and follow-ups).
     pub fn ai_set_reminder_done(&self, id: MessageId, done: bool) -> Result<Insight> {
-        let mut ins = self.ai_insight(id).ok_or_else(|| Error::NotFound("这封邮件还没有智能分析结果".into()))?;
-        ins.done = done;
-        self.ai_put_insight(&ins)?;
-        self.events.emit(Event::AiInsight { message_id: id });
-        Ok(ins)
+        let follow_up = super::followup::set_done(self, id, done);
+        match self.ai_insight(id) {
+            Some(mut ins) => {
+                ins.done = done;
+                self.ai_put_insight(&ins)?;
+                self.events.emit(Event::AiInsight { message_id: id });
+                Ok(ins)
+            }
+            None => match follow_up {
+                Some(ins) => {
+                    self.events.emit(Event::AiInsight { message_id: id });
+                    Ok(ins)
+                }
+                None => Err(Error::NotFound("这封邮件还没有智能分析结果".into())),
+            },
+        }
     }
 }
 
@@ -316,5 +353,28 @@ mod tests {
         assert_eq!(ins.todos, vec!["确认分工"]);
         assert_eq!(ins.one_line.chars().count(), 41); // 40 + "…"
         assert_eq!(ins.remind_at, None);
+        assert!(ins.events.is_empty() && ins.risk.is_none() && ins.risk_reason.is_empty());
+    }
+
+    #[test]
+    fn insight_with_risk_and_events() {
+        let v: Value = serde_json::from_str(
+            r#"{"needs_reply":false,"priority":"low","risk":"phishing","risk_reason":"冒充 Apple 索要验证码",
+                "events":[{"title":"评审会","start":"2099-01-05 15:00","end":"2099-01-05 16:00","all_day":false,"location":null,
+                           "notes":"Q4 规划","source_text":"下周一下午 3 点"}]}"#,
+        )
+        .unwrap();
+        let ins = parse_insight(&v, 9, 1_000);
+        assert_eq!(ins.risk.as_deref(), Some("phishing"));
+        assert_eq!(ins.risk_reason, "冒充 Apple 索要验证码");
+        assert_eq!(ins.events.len(), 1);
+        assert_eq!(ins.events[0].title, "评审会");
+        assert_eq!(ins.events[0].end, Some(ins.events[0].start + 3600));
+        assert_eq!(parse_risk(&serde_json::json!("SCAM")).as_deref(), Some("scam"));
+        assert_eq!(parse_risk(&serde_json::json!("诈骗")).as_deref(), Some("scam"));
+        assert_eq!(parse_risk(&serde_json::json!("none")), None);
+        assert_eq!(parse_risk(&Value::Null), None);
+        let v: Value = serde_json::from_str(r#"{"risk":null,"risk_reason":"看起来正常"}"#).unwrap();
+        assert!(parse_insight(&v, 1, 0).risk_reason.is_empty());
     }
 }

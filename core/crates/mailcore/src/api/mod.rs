@@ -1,5 +1,6 @@
 //! Local HTTP API (127.0.0.1 only) used by the macOS app, the menu bar helper and the
-//! share extension. Every request needs the per-launch token from `daemon.json`.
+//! share extension. Every request needs the per-launch token from `daemon.json`, except
+//! the built-in MCP server (`/mcp`), which also accepts the MCP token.
 
 mod ai;
 mod routes;
@@ -82,7 +83,8 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
         return (StatusCode::FORBIDDEN, "bad host").into_response();
     }
     let path = req.uri().path();
-    if path == "/oauth/callback" || path == "/health" {
+    // `/mcp` checks its own token (the API token or the separate MCP token).
+    if path == "/oauth/callback" || path == "/health" || path == "/mcp" {
         return next.run(req).await;
     }
     let bearer = req
