@@ -6,6 +6,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var snapshot: MenuSnapshot?
     private var statuses: [String: AccountStatus] = [:]
     private var engineError: String?
+    /// "✨ 待处理" count from `GET /v1/ai/reminders`.
+    private var aiPending = 0
 
     var unread: Int = 0 {
         didSet { updateButton() }
@@ -50,6 +52,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let snap = try? await APIClient.shared.menu(limit: 10) else { return }
         snapshot = snap
         unread = snap.unread
+        if let reminders = try? await APIClient.shared.aiReminders() { aiPending = reminders.count }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -71,6 +74,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             mi.image = colorDot(entry.accountColor)
             menu.addItem(mi)
         }
+        menu.addItem(.separator())
+        if aiPending > 0 {
+            let pending = action("✨ 待处理 \(aiPending)", #selector(openPending), "")
+            pending.toolTip = "AI 发现需要回复、有截止时间或待办的邮件"
+            menu.addItem(pending)
+        }
+        menu.addItem(action("✨ AI 助手", #selector(openAssistant), ""))
         menu.addItem(.separator())
         menu.addItem(action("写新邮件", #selector(compose), "n"))
         menu.addItem(action("检查新邮件", #selector(syncNow), "r"))
@@ -136,6 +146,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openApp() {
         Daemon.openMainApp()
+    }
+
+    @objc private func openPending() {
+        if let url = URL(string: "mailboxai://pending") { Daemon.openMainApp(url: url) }
+    }
+
+    @objc private func openAssistant() {
+        if let url = URL(string: "mailboxai://assistant") { Daemon.openMainApp(url: url) }
     }
 
     @objc private func syncNow() {

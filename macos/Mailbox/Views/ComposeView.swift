@@ -41,6 +41,11 @@ final class ComposeModel: ObservableObject {
                 everSaved = true
             } else if let r = req.replyTo {
                 draft = try await api.replyDraft(r, mode: req.mode)
+                if let body = req.body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // Prefilled reply (AI suggested reply): the text goes above the signature and quote.
+                    draft.html = AIText.html(body) + draft.html
+                    dirty = true
+                }
             } else if let e = req.editServerDraft {
                 draft = try await api.editDraft(e)
                 everSaved = true
@@ -276,21 +281,36 @@ struct ComposeWindow: View {
     @Environment(\.dismiss) private var dismiss
     let request: ComposeRequest
     @StateObject private var model = ComposeModel()
+    @StateObject private var ai = ComposeAIModel()
     @State private var dropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            if model.markdownMode {
-                TextEditor(text: $model.markdownText)
-                    .font(.system(.body, design: .monospaced))
-                    .padding(8)
-                    .onChange(of: model.markdownText) { _, _ in model.markDirty() }
-            } else {
-                FormatBar(editor: model.editor)
+            if showsQuickReply {
+                AIQuickReplyBar(ai: ai, compose: model)
                 Divider()
-                RichEditor(controller: model.editor)
+            }
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    if model.markdownMode {
+                        TextEditor(text: $model.markdownText)
+                            .font(.system(.body, design: .monospaced))
+                            .padding(8)
+                            .onChange(of: model.markdownText) { _, _ in model.markDirty() }
+                    } else {
+                        FormatBar(editor: model.editor)
+                        Divider()
+                        RichEditor(controller: model.editor)
+                    }
+                }
+                if ai.visible {
+                    Divider()
+                    AIComposePanel(ai: ai, stream: ai.stream, compose: model)
+                        .frame(width: 320)
+                        .transition(.move(edge: .trailing))
+                }
             }
             if !model.draft.attachments.isEmpty {
                 Divider()
@@ -317,13 +337,20 @@ struct ComposeWindow: View {
                     .allowsHitTesting(false)
             }
         }
-        .onDisappear { Task { await model.closeWithoutSending() } }
+        .onDisappear {
+            ai.stream.cancel()
+            Task { await model.closeWithoutSending() }
+        }
         .alert("无法发送", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("好") {}
         } message: {
             Text(model.error ?? "")
         }
         .sheet(isPresented: $model.showSchedule) { scheduleSheet }
+    }
+
+    private var showsQuickReply: Bool {
+        model.loaded && model.draft.sourceMessageId != nil && (model.draft.mode == .reply || model.draft.mode == .replyAll)
     }
 
     private var identities: [Identity] {
@@ -412,6 +439,7 @@ struct ComposeWindow: View {
                 }
             } label: { Label("模板", systemImage: "text.badge.plus") }
             .menuStyle(.borderlessButton).fixedSize()
+            AIComposeMenu(ai: ai, compose: model)
             Menu {
                 Toggle("Markdown 模式", isOn: Binding(get: { model.markdownMode }, set: { _ in Task { await model.toggleMarkdown() } }))
                 Toggle("纯文本", isOn: $model.draft.plainTextOnly)

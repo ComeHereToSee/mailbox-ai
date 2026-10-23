@@ -34,6 +34,13 @@ struct MultiSelectionView: View {
                 Button("垃圾邮件") { Task { await state.act(ids, .spam) } }
                 Button("删除", role: .destructive) { Task { await state.act(ids, .trash) } }
             }
+            Button {
+                AIState.shared.batchIds = ids
+            } label: {
+                Label("AI 批量处理…", systemImage: "sparkles")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.purple)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -49,6 +56,7 @@ struct ThreadView: View {
     @State private var showSnooze = false
     @State private var showMove = false
     @State private var showSource = false
+    @StateObject private var aiModel = ReaderAIModel()
 
     private var subject: String { details.last?.summary.subject ?? "" }
     private var current: MessageDetail? { details.first { $0.id == messageId } ?? details.last }
@@ -61,11 +69,13 @@ struct ThreadView: View {
                 }
                 if !details.isEmpty {
                     header
+                    AIThreadCard(model: aiModel, messageId: messageId)
                     ForEach(details) { d in
                         MessageCard(detail: d, expanded: expanded.contains(d.id) || details.count == 1, onToggle: {
                             if expanded.contains(d.id) { expanded.remove(d.id) } else { expanded.insert(d.id) }
                         }, onReload: { Task { await load() } })
                     }
+                    AISuggestedReplies(model: aiModel, messageId: messageId)
                 } else if loading {
                     ProgressView().frame(maxWidth: .infinity).padding(40)
                 }
@@ -75,6 +85,7 @@ struct ThreadView: View {
             .frame(maxWidth: .infinity)
         }
         .task(id: messageId) { await load() }
+        .onDisappear { aiModel.cancelAll() }
         .toolbar { toolbar }
         .sheet(isPresented: $showSnooze) {
             SnoozePicker { date in
@@ -111,6 +122,7 @@ struct ThreadView: View {
                     if details.count > 1 { Text("\(details.count) 封邮件").font(.caption).foregroundStyle(.secondary) }
                 }
             }
+            AIInsightChips(messageId: messageId)
         }
         .padding(.bottom, 4)
     }
@@ -132,6 +144,7 @@ struct ThreadView: View {
             } label: {
                 Label("星标", systemImage: current?.summary.flags.flagged == true ? "star.fill" : "star")
             }
+            AIReaderMenu(model: aiModel, messageId: messageId, current: current, threadCount: details.count)
             Menu {
                 moreMenu
             } label: {
@@ -178,6 +191,7 @@ struct ThreadView: View {
             let t = try await state.api.thread(messageId)
             details = t
             error = nil
+            aiModel.prepare(messageId: messageId, details: t)
             var open = Set(t.filter { !$0.summary.flags.seen }.map(\.id))
             if let last = t.last { open.insert(last.id) }
             open.insert(messageId)

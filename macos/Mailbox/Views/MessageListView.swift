@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MessageListView: View {
     @EnvironmentObject private var state: AppState
+    @ObservedObject private var ai = AIState.shared
     @State private var searchTask: Task<Void, Never>?
     @State private var snoozeTarget: [Int64] = []
     @State private var moveTarget: [Int64] = []
@@ -10,7 +11,8 @@ struct MessageListView: View {
         List(selection: $state.selection) {
             ForEach(state.messages) { m in
                 MessageRow(message: m, account: state.account(for: m), showAccount: showsAccount, density: state.settings.listDensity,
-                           showSnippet: state.settings.showSnippets)
+                           showSnippet: state.settings.showSnippets,
+                           insight: state.selectedMailbox == AIState.pendingMailbox ? ai.insightForList(m.id) : nil)
                     .tag(m.id)
                     .contextMenu { contextMenu(for: m) }
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -93,6 +95,10 @@ struct MessageListView: View {
                 } label: {
                     Label("筛选", systemImage: state.listFilter == .all ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
                 }
+                if state.selection.count > 1 {
+                    Button { ai.batchIds = Array(state.selection) } label: { Label("AI 批量处理…", systemImage: "sparkles") }
+                        .help("✨ AI 批量处理所选邮件")
+                }
                 Button { state.sync() } label: { Label("检查新邮件", systemImage: "arrow.clockwise") }
                 Button { state.compose(ComposeRequest(accountId: currentAccountId)) } label: { Label("写邮件", systemImage: "square.and.pencil") }
             }
@@ -129,7 +135,10 @@ struct MessageListView: View {
     }
 
     private var emptyHint: String {
-        state.accounts.isEmpty ? "添加一个邮箱账户开始使用" : "这里空空如也"
+        if state.selectedMailbox == AIState.pendingMailbox {
+            return ai.isConfigured ? "AI 没有发现需要处理的邮件" : "在 设置 → AI 服务 中设置模型后，AI 会自动找出需要回复和有截止时间的邮件"
+        }
+        return state.accounts.isEmpty ? "添加一个邮箱账户开始使用" : "这里空空如也"
     }
 
     private var title: String {
@@ -144,6 +153,7 @@ struct MessageListView: View {
         case "pinned": return "置顶"
         case "attachments": return "有附件"
         case "all": return "所有邮件"
+        case AIState.pendingMailbox: return "待处理"
         default: break
         }
         if m.hasPrefix("unified:") { return FolderRole(rawValue: String(m.dropFirst(8)))?.title ?? "邮件" }
@@ -183,6 +193,14 @@ struct MessageListView: View {
     @ViewBuilder
     private func contextMenu(for m: MessageSummary) -> some View {
         let ids = targets(for: m)
+        if ids.count > 1 {
+            Button("✨ AI 批量处理…") { ai.batchIds = ids }
+            Divider()
+        }
+        if state.selectedMailbox == AIState.pendingMailbox {
+            Button("✨ 标为已处理") { Task { await ai.setDone(m.id, done: true) } }
+            Divider()
+        }
         Button("回复") { state.reply(m.id, mode: .reply) }
         Button("全部回复") { state.reply(m.id, mode: .replyAll) }
         Button("转发") { state.reply(m.id, mode: .forward) }
@@ -262,6 +280,8 @@ struct MessageRow: View {
     let showAccount: Bool
     let density: String
     let showSnippet: Bool
+    /// Shown in the "✨ 待处理" list: deadline and AI one-liner.
+    var insight: AIInsight? = nil
 
     private var unread: Bool { !message.flags.seen || message.threadUnread > 0 }
 
@@ -301,7 +321,23 @@ struct MessageRow: View {
                     .font(.callout)
                     .fontWeight(unread ? .medium : .regular)
                     .lineLimit(1)
-                if showSnippet && density != "compact" && !message.snippet.isEmpty {
+                if let insight {
+                    HStack(spacing: 4) {
+                        if let d = insight.deadline {
+                            AIChip(text: "截止 " + AIFmt.deadline(d), symbol: "clock", color: AIFmt.isOverdueSoon(d) ? .red : .blue)
+                        } else if insight.needsReply {
+                            AIChip(text: "需回复", symbol: "arrowshape.turn.up.left", color: .orange)
+                        }
+                        if insight.priority == "high" {
+                            AIChip(text: "高优先级", color: .red)
+                        }
+                        Text(insight.oneLine.isEmpty ? (insight.todos.first ?? "") : insight.oneLine)
+                            .font(.caption)
+                            .foregroundStyle(.purple)
+                            .lineLimit(1)
+                    }
+                }
+                if showSnippet && density != "compact" && !message.snippet.isEmpty && insight == nil {
                     Text(message.snippet)
                         .font(.caption)
                         .foregroundStyle(.secondary)

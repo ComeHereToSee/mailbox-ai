@@ -468,6 +468,10 @@ struct MailboxCommands: Commands {
                 .keyboardShortcut("c", modifiers: [.command, .shift])
             Button("撤销") { Task { await state.undoLast() } }
                 .disabled(state.toast?.undoToken == nil && state.toast?.outboxId == nil)
+            Divider()
+            Button("✨ AI 助手") { WindowRouter.shared.showAssistant() }
+            Button("✨ AI 批量处理所选邮件…") { AIState.shared.batchIds = selected }
+                .disabled(selected.count < 2)
         }
     }
 }

@@ -21,6 +21,12 @@ struct MailboxApp: App {
         }
         .defaultSize(width: 760, height: 640)
 
+        Window("AI 助手", id: "assistant") {
+            AssistantWindow()
+                .environmentObject(state)
+        }
+        .defaultSize(width: 820, height: 640)
+
         SwiftUI.Settings {
             SettingsView()
                 .environmentObject(state)
@@ -59,6 +65,20 @@ final class WindowRouter {
 
     func showMain() {
         openWindow?(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Set when the assistant was requested before the main window captured `openWindow`.
+    var pendingAssistant = false
+
+    /// Opens the "✨ AI 助手" window, optionally on a Loop's results.
+    func showAssistant(loop: String? = nil) {
+        if let loop { AssistantModel.shared.focus(loop: loop) }
+        if let open = openWindow {
+            open(id: "assistant")
+        } else {
+            pendingAssistant = true
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 }

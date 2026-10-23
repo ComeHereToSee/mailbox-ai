@@ -56,8 +56,57 @@ final class HelperDelegate: NSObject, NSApplicationDelegate {
             if status == .failed, let error {
                 notifications.postSendFailure(error)
             }
+        case .aiInsight:
+            scheduleMenuRefresh()
+        case let .aiReminder(messageId, title, body):
+            notifications.postAI(identifier: "ai-reminder-\(messageId)", title: title.isEmpty ? "⏰ 待处理邮件" : title, body: body,
+                                 url: "mailboxai://message/\(messageId)", timeSensitive: true)
+            scheduleMenuRefresh()
+        case let .aiLoop(loopId, runId, name, status, preview):
+            postLoop(loopId: loopId, runId: runId, name: name, status: status, preview: preview)
+        case let .aiAutoreply(messageId, ruleName, draftId, sent, subject):
+            postAutoReply(messageId: messageId, ruleName: ruleName, draftId: draftId, sent: sent, subject: subject)
         default:
             break
+        }
+    }
+
+    /// `ai_loop` carries no `notify` flag: look the Loop up and respect its setting (default: notify).
+    private func postLoop(loopId: String, runId: String, name: String, status: String, preview: String) {
+        let notifications = self.notifications
+        Task {
+            let loops = (try? await APIClient.shared.aiLoops()) ?? []
+            let notify = loops.first { $0.id == loopId }?.notify ?? true
+            guard notify else { return }
+            let failed = status == "failed" || status == "error"
+            var body = preview.isEmpty ? "已完成" : preview
+            if failed { body = preview.isEmpty ? "运行失败" : "运行失败：" + preview }
+            await MainActor.run {
+                notifications.postAI(identifier: "ai-loop-\(runId.isEmpty ? UUID().uuidString : runId)", title: "✨ \(name)", body: body,
+                                     url: "mailboxai://assistant?loop=\(loopId)")
+            }
+        }
+    }
+
+    /// "✨ 已为 发件人 生成回复草稿" / "已自动回复 发件人".
+    private func postAutoReply(messageId: Int64, ruleName: String, draftId: String?, sent: Bool, subject: String) {
+        let notifications = self.notifications
+        Task {
+            let sender = (try? await APIClient.shared.message(messageId))?.summary.from.display ?? "发件人"
+            let title = sent ? "✨ 已自动回复 \(sender)" : "✨ 已为 \(sender) 生成回复草稿"
+            let url: String
+            if !sent, let draftId, !draftId.isEmpty {
+                url = "mailboxai://draft/\(draftId)"
+            } else {
+                url = "mailboxai://message/\(messageId)"
+            }
+            var parts: [String] = []
+            if !subject.isEmpty { parts.append(subject) }
+            if !ruleName.isEmpty { parts.append("规则：" + ruleName) }
+            let body = parts.isEmpty ? "点按查看" : parts.joined(separator: " · ")
+            await MainActor.run {
+                notifications.postAI(identifier: "ai-autoreply-\(messageId)", title: title, body: body, url: url)
+            }
         }
     }
 

@@ -715,6 +715,12 @@ enum MailEvent {
     case settingsChanged
     case snoozed(messageId: Int64)
     case resync
+    // AI (docs/AI.md §5)
+    case aiInsight(messageId: Int64)
+    case aiReminder(messageId: Int64, title: String, body: String)
+    case aiJob(jobId: String, done: Int, total: Int, status: String)
+    case aiLoop(loopId: String, runId: String, name: String, status: String, preview: String)
+    case aiAutoreply(messageId: Int64, ruleName: String, draftId: String?, sent: Bool, subject: String)
     case unknown
 
     private struct Envelope: Decodable {
@@ -745,6 +751,43 @@ enum MailEvent {
         var error: String?
     }
 
+    private struct AIEnvelope: Decodable {
+        var messageId: Int64?
+        var title: String?
+        var body: String?
+        var jobId: String?
+        var done: Int?
+        var total: Int?
+        var status: String?
+        var loopId: String?
+        var runId: String?
+        var name: String?
+        var preview: String?
+        var ruleName: String?
+        var draftId: String?
+        var sent: Bool?
+        var subject: String?
+    }
+
+    private static func decodeAI(_ type: String, _ data: Data) -> MailEvent {
+        guard let e = try? JSON.decoder.decode(AIEnvelope.self, from: data) else { return .unknown }
+        switch type {
+        case "ai_insight":
+            return .aiInsight(messageId: e.messageId ?? 0)
+        case "ai_reminder":
+            return .aiReminder(messageId: e.messageId ?? 0, title: e.title ?? "", body: e.body ?? "")
+        case "ai_job":
+            return .aiJob(jobId: e.jobId ?? "", done: e.done ?? 0, total: e.total ?? 0, status: e.status ?? "")
+        case "ai_loop":
+            return .aiLoop(loopId: e.loopId ?? "", runId: e.runId ?? "", name: e.name ?? "", status: e.status ?? "", preview: e.preview ?? "")
+        case "ai_autoreply":
+            return .aiAutoreply(messageId: e.messageId ?? 0, ruleName: e.ruleName ?? "", draftId: e.draftId, sent: e.sent ?? false,
+                                subject: e.subject ?? "")
+        default:
+            return .unknown
+        }
+    }
+
     static func decode(_ data: Data) -> MailEvent {
         guard let env = try? JSON.decoder.decode(Envelope.self, from: data) else { return .unknown }
         switch env.type {
@@ -772,6 +815,7 @@ enum MailEvent {
         case "settings_changed": return .settingsChanged
         case "snoozed": return .snoozed(messageId: env.messageId ?? 0)
         case "resync": return .resync
+        case "ai_insight", "ai_reminder", "ai_job", "ai_loop", "ai_autoreply": return decodeAI(env.type, data)
         default: return .unknown
         }
     }

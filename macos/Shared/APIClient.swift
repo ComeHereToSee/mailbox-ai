@@ -120,6 +120,55 @@ final class APIClient: @unchecked Sendable {
     }
 }
 
+// MARK: - NDJSON streaming (`/v1/ai/*`, docs/AI.md §1)
+
+extension APIClient {
+    /// POSTs `body` and yields each line of the `application/x-ndjson` response.
+    /// Errors raised before the stream starts arrive as `APIError` (e.g. code `ai_not_configured`).
+    func ndjson(_ path: String, body: any Encodable) -> AsyncThrowingStream<AIStreamLine, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let bodyData = try JSON.encoder.encode(body)
+                    var attempt = 0
+                    while true {
+                        var req = try self.makeRequest("POST", path, query: [:], body: bodyData)
+                        // Subscription CLIs can take a while before the first token.
+                        req.timeoutInterval = 600
+                        req.setValue("application/x-ndjson", forHTTPHeaderField: "Accept")
+                        let (bytes, resp) = try await self.session.bytes(for: req)
+                        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                        if status == 401, attempt == 0, self.reloadInfo() {
+                            attempt += 1
+                            continue
+                        }
+                        guard (200..<300).contains(status) else {
+                            var data = Data()
+                            for try await b in bytes { data.append(b) }
+                            struct E: Decodable { var error: String; var code: String? }
+                            let e = try? JSONDecoder().decode(E.self, from: data)
+                            throw APIError(status: status, message: e?.error ?? "请求失败（\(status)）", code: e?.code ?? "http")
+                        }
+                        for try await line in bytes.lines {
+                            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+                                  let parsed = try? JSON.decoder.decode(AIStreamLine.self, from: data) else { continue }
+                            continuation.yield(parsed)
+                        }
+                        break
+                    }
+                    continuation.finish()
+                } catch let e as URLError where e.code == .cannotConnectToHost || e.code == .networkConnectionLost {
+                    continuation.finish(throwing: APIError(status: 0, message: "无法连接邮件服务", code: "offline"))
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 struct EmptyBody: Encodable {}
 
 struct OK: Decodable {

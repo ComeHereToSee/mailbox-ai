@@ -127,8 +127,13 @@ final class AppState: ObservableObject {
         events = stream
         stream.start()
         let demo = CommandLine.arguments.contains("--demo")
-        if demo { try? await api.seedDemo() }
+        if demo {
+            try? await api.seedDemo()
+            // Insights, a finished Loop, a cached summary and a default model, so AI screens have content.
+            try? await api.seedAIDemo()
+        }
         await reloadAll()
+        await AIState.shared.reload()
         if demo, let first = messages.first { selection = [first.id] }
         if accounts.isEmpty { showOnboarding = true }
         if settings.appLock { locked = true }
@@ -196,6 +201,14 @@ final class AppState: ObservableObject {
     func reloadMessages() async {
         loadingMessages = true
         defer { loadingMessages = false }
+        if selectedMailbox == AIState.pendingMailbox && !isSearching {
+            // "✨ 待处理": messages that AI flagged (needs reply / deadline / todos).
+            await AIState.shared.reloadReminders()
+            messages = AIState.shared.reminders.map(\.message)
+            cursor = nil
+            selection = selection.filter { id in messages.contains { $0.id == id } }
+            return
+        }
         let threads = settings.conversationView && !selectedMailbox.hasPrefix("unified:drafts")
         let limit = max(100, messages.count)
         guard let page = try? await api.messages(mailbox: listMailbox, query: effectiveQuery, threads: threads, limit: limit) else { return }
@@ -397,6 +410,9 @@ final class AppState: ObservableObject {
         switch event {
         case .messagesChanged, .snoozed:
             scheduleReload()
+            AIState.shared.scheduleRemindersReload()
+        case .aiInsight, .aiReminder, .aiJob, .aiLoop, .aiAutoreply:
+            AIState.shared.handle(event)
         case .newMail:
             scheduleReload(delay: 100_000_000)
         case .foldersChanged:
@@ -462,6 +478,19 @@ final class AppState: ObservableObject {
         case "add-account":
             WindowRouter.shared.showMain()
             showAddAccount = true
+        case "assistant":
+            let loop = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "loop" })?.value
+            WindowRouter.shared.showAssistant(loop: loop)
+        case "pending":
+            WindowRouter.shared.showMain()
+            searchText = ""
+            select(mailbox: AIState.pendingMailbox)
+        case "draft":
+            if let id = parts.first, let d = try? await api.draft(id) {
+                compose(ComposeRequest(draft: d))
+            } else {
+                WindowRouter.shared.showMain()
+            }
         default:
             WindowRouter.shared.showMain()
         }

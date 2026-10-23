@@ -3,6 +3,7 @@ import SwiftUI
 struct SidebarView: View {
     @EnvironmentObject private var state: AppState
     @ObservedObject private var web = WebMailStore.shared
+    @ObservedObject private var ai = AIState.shared
     @State private var collapsed: Set<String> = []
     @State private var renaming: Folder?
     @State private var newFolderFor: String?
@@ -38,6 +39,17 @@ struct SidebarView: View {
                 }
             }
             Section("智能邮箱") {
+                row(AIState.pendingMailbox, "待处理", symbol: "sparkles", badge: ai.reminders.count)
+                    .help("AI 发现需要回复、有截止时间或待办的邮件")
+                Button {
+                    WindowRouter.shared.showAssistant()
+                } label: {
+                    Label("AI 助手", systemImage: "sparkles.rectangle.stack")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("问问邮箱、查看 Loop 结果")
                 row("unread", "未读", symbol: "envelope.badge", badge: state.counts["unread"])
                 row("starred", "星标", symbol: "star", badge: state.counts["starred"])
                 row("vip", "VIP", symbol: "crown", badge: state.counts["vip"])

@@ -33,6 +33,19 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
         center.add(req)
     }
 
+    /// AI notifications (reminders, Loop results, auto-replies); a click opens `url` in the main app.
+    func postAI(identifier: String, title: String, subtitle: String? = nil, body: String, url: String, timeSensitive: Bool = false) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        if let subtitle, !subtitle.isEmpty { content.subtitle = subtitle }
+        content.body = body
+        content.threadIdentifier = "ai"
+        content.userInfo = ["url": url]
+        content.sound = .default
+        if timeSensitive { content.interruptionLevel = .timeSensitive }
+        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+    }
+
     func postSendFailure(_ error: String) {
         let content = UNMutableNotificationContent()
         content.title = "邮件发送失败"
@@ -49,6 +62,13 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
+        if let link = info["url"] as? String, let url = URL(string: link) {
+            if response.actionIdentifier != UNNotificationDismissActionIdentifier {
+                DispatchQueue.main.async { Daemon.openMainApp(url: url) }
+            }
+            completionHandler()
+            return
+        }
         guard let id = (info["message_id"] as? NSNumber)?.int64Value ?? (info["message_id"] as? Int64) else {
             completionHandler()
             return

@@ -54,6 +54,36 @@ final class RichEditorController: NSObject, ObservableObject, WKScriptMessageHan
         webView?.evaluateJavaScript("document.getElementById('editor').focus()")
     }
 
+    // MARK: AI helpers
+
+    /// Plain text of the current selection inside the editor ("" when nothing is selected).
+    /// Also remembers that range so `replaceSelection` / `insertBelow` act on it later.
+    func selectedText() async -> String {
+        guard let web = webView, ready else { return "" }
+        return ((try? await web.evaluateJavaScript("aiSelectedText()")) as? String) ?? ""
+    }
+
+    /// Plain text of the body, without the signature (#mailbox-signature) and the quoted original (#mailbox-quote).
+    func bodyText() async -> String {
+        guard let web = webView, ready else { return ComposeModel.plain(lastHTML) }
+        return ((try? await web.evaluateJavaScript("aiBodyText()")) as? String) ?? ""
+    }
+
+    /// Replaces the range captured by `selectedText()` (or the current selection).
+    func replaceSelection(html: String) {
+        webView?.evaluateJavaScript("aiReplaceSelection(\(Self.jsString(html)))")
+    }
+
+    /// Replaces the whole body, keeping the signature and the quoted original.
+    func replaceBody(html: String) {
+        webView?.evaluateJavaScript("aiReplaceBody(\(Self.jsString(html)))")
+    }
+
+    /// Inserts after the captured selection, or at the end of the body (above the signature).
+    func insertBelow(html: String) {
+        webView?.evaluateJavaScript("aiInsertBelow(\(Self.jsString(html)))")
+    }
+
     static func jsString(_ s: String) -> String {
         let data = (try? JSONSerialization.data(withJSONObject: [s])) ?? Data("[\"\"]".utf8)
         let arr = String(data: data, encoding: .utf8) ?? "[\"\"]"
@@ -113,6 +143,106 @@ final class RichEditorController: NSObject, ObservableObject, WKScriptMessageHan
       let sig = document.getElementById('mailbox-signature');
       if (!sig) { sig = document.createElement('div'); sig.id = 'mailbox-signature'; const q = document.getElementById('mailbox-quote'); ed.insertBefore(sig, q); }
       sig.innerHTML = html; changed();
+    }
+    // AI: remember the last selection inside the editor; menus outside the web view keep it.
+    let lastRange = null, aiRange = null;
+    document.addEventListener('selectionchange', () => {
+      const s = window.getSelection();
+      if (s && s.rangeCount > 0) {
+        const r = s.getRangeAt(0);
+        if (ed.contains(r.commonAncestorContainer)) lastRange = r.cloneRange();
+      }
+    });
+    function renderedText(node) {
+      const box = document.createElement('div');
+      box.style.cssText = 'position:absolute;left:-100000px;top:0;width:640px;white-space:normal;';
+      box.appendChild(node);
+      document.body.appendChild(box);
+      const t = box.innerText;
+      box.remove();
+      return t;
+    }
+    function aiSelectedText() {
+      const r = lastRange;
+      if (!r || r.collapsed || !ed.contains(r.commonAncestorContainer)) { aiRange = null; return ''; }
+      aiRange = r.cloneRange();
+      return renderedText(r.cloneContents()).trim();
+    }
+    function aiBodyText() {
+      const c = ed.cloneNode(true);
+      c.removeAttribute('id');
+      c.removeAttribute('contenteditable');
+      c.querySelectorAll('#mailbox-signature, #mailbox-quote').forEach(n => n.remove());
+      return renderedText(c).trim();
+    }
+    function aiFragment(html) {
+      const t = document.createElement('div');
+      t.innerHTML = html;
+      const f = document.createDocumentFragment();
+      while (t.firstChild) f.appendChild(t.firstChild);
+      return f;
+    }
+    function aiAnchor() {
+      // Body goes above the signature; with the reply below the quote, between quote and signature.
+      const sig = document.getElementById('mailbox-signature');
+      const quote = document.getElementById('mailbox-quote');
+      if (quote && sig && (quote.compareDocumentPosition(sig) & Node.DOCUMENT_POSITION_FOLLOWING)) return sig;
+      const first = [sig, quote].filter(Boolean)[0];
+      if (!first) return null;
+      let n = first;
+      while (n.parentNode && n.parentNode !== ed) n = n.parentNode;
+      return n.parentNode === ed ? n : null;
+    }
+    function aiKeep(n) {
+      const sig = document.getElementById('mailbox-signature');
+      const quote = document.getElementById('mailbox-quote');
+      return [sig, quote].some(k => k && (n === k || n.contains(k)));
+    }
+    function aiReplaceSelection(html) {
+      const r = aiRange || lastRange;
+      if (!r || r.collapsed) { aiReplaceBody(html); return; }
+      ed.focus();
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      document.execCommand('insertHTML', false, html);
+      aiRange = null;
+      changed();
+    }
+    function aiReplaceBody(html) {
+      const quote = document.getElementById('mailbox-quote');
+      const sig = document.getElementById('mailbox-signature');
+      const bottom = quote && sig && (quote.compareDocumentPosition(sig) & Node.DOCUMENT_POSITION_FOLLOWING);
+      [...ed.childNodes].forEach(n => {
+        if (aiKeep(n)) return;
+        // With the reply below the quote, only the part between quote and signature is the body.
+        if (bottom && (n.compareDocumentPosition(quote) & Node.DOCUMENT_POSITION_FOLLOWING)) return;
+        n.remove();
+      });
+      const anchor = aiAnchor();
+      const frag = aiFragment(html + (anchor ? '<div><br></div>' : ''));
+      if (anchor) ed.insertBefore(frag, anchor); else ed.appendChild(frag);
+      aiRange = null;
+      changed();
+    }
+    function aiInsertBelow(html) {
+      const r = aiRange;
+      if (r && !r.collapsed) {
+        ed.focus();
+        const c = r.cloneRange();
+        c.collapse(false);
+        const s = window.getSelection();
+        s.removeAllRanges();
+        s.addRange(c);
+        document.execCommand('insertHTML', false, html);
+        aiRange = null;
+        changed();
+        return;
+      }
+      const anchor = aiAnchor();
+      const frag = aiFragment(html);
+      if (anchor) ed.insertBefore(frag, anchor); else ed.appendChild(frag);
+      changed();
     }
     function readImages(files) {
       for (const f of files) {

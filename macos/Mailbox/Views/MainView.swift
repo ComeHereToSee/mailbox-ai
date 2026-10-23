@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MainView: View {
     @EnvironmentObject private var state: AppState
+    @ObservedObject private var ai = AIState.shared
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     @State private var columns = NavigationSplitViewVisibility.all
@@ -37,6 +38,10 @@ struct MainView: View {
                 WindowRouter.shared.pendingSettings = false
                 openSettings()
             }
+            if WindowRouter.shared.pendingAssistant {
+                WindowRouter.shared.pendingAssistant = false
+                openWindow(id: "assistant")
+            }
         }
         .onContinueUserActivity(CSSearchableItemActionType) { activity in
             if let id = SpotlightIndexer.messageId(from: activity) {
@@ -54,6 +59,9 @@ struct MainView: View {
         }
         .sheet(isPresented: $state.showAddAccount) {
             AddAccountView().environmentObject(state)
+        }
+        .sheet(isPresented: Binding(get: { !ai.batchIds.isEmpty }, set: { if !$0 { ai.batchIds = [] } })) {
+            AIBatchSheet(ids: ai.batchIds).environmentObject(state)
         }
     }
 

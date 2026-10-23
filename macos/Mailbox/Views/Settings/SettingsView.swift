@@ -11,6 +11,8 @@ struct SettingsView: View {
         TabView(selection: $tab) {
             GeneralSettings().tabItem { Label("通用", systemImage: "gearshape") }.tag("general")
             AccountsSettings().tabItem { Label("账户", systemImage: "person.crop.circle") }.tag("accounts")
+            AIProvidersSettings().tabItem { Label("AI 服务", systemImage: "sparkles") }.tag("ai")
+            AIFeaturesSettings().tabItem { Label("AI 功能", systemImage: "wand.and.stars") }.tag("ai_features")
             NotificationSettings().tabItem { Label("通知", systemImage: "bell.badge") }.tag("notifications")
             RulesSettings().tabItem { Label("规则", systemImage: "line.3.horizontal.decrease.circle") }.tag("rules")
             ComposeSettings().tabItem { Label("写信", systemImage: "square.and.pencil") }.tag("compose")
@@ -20,8 +22,11 @@ struct SettingsView: View {
             AdvancedSettings().tabItem { Label("高级", systemImage: "wrench.and.screwdriver") }.tag("advanced")
         }
         .environmentObject(state)
-        .frame(width: 800, height: 560)
+        // The AI tabs use a provider list + detail layout and need more room.
+        .frame(width: isAITab ? 940 : 880, height: isAITab ? 660 : 560)
     }
+
+    private var isAITab: Bool { tab == "ai" || tab == "ai_features" }
 }
 
 /// Saves settings after a short pause so toggles feel instant.
@@ -950,7 +955,14 @@ struct AdvancedSettings: View {
                     Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([Daemon.dataDir]) }
                     Button("打开日志") { NSWorkspace.shared.open(Daemon.dataDir.appendingPathComponent("logs/mailcore.log")) }
                 }
-                Button("添加演示数据") { Task { try? await state.api.seedDemo(); await state.reloadAll() } }
+                Button("添加演示数据") {
+                    Task {
+                        try? await state.api.seedDemo()
+                        try? await state.api.seedAIDemo()
+                        await state.reloadAll()
+                        await AIState.shared.reload()
+                    }
+                }
             }
         }
         .formStyle(.grouped)
@@ -1011,7 +1023,9 @@ struct OnboardingView: View {
                 Button("先看看演示数据") {
                     Task {
                         try? await state.api.seedDemo()
+                        try? await state.api.seedAIDemo()
                         await state.reloadAll()
+                        await AIState.shared.reload()
                         dismiss()
                     }
                 }
