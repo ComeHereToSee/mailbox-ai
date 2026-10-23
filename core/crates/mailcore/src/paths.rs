@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Resolves the directory holding the database, message blobs and secrets.
 ///
-/// `MAILBOX_DATA_DIR` wins; otherwise `~/Library/Application Support/Mailbox` on macOS and
+/// `MAILBOX_DATA_DIR` wins; otherwise `~/Library/Application Support/Mailbox AI` on macOS and
 /// `$XDG_DATA_HOME/mailbox` elsewhere.
 pub fn default_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("MAILBOX_DATA_DIR") {
@@ -12,9 +12,9 @@ pub fn default_data_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Mailbox")
+        home.join("Library/Application Support/Mailbox AI")
     } else if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("mailbox")
+        PathBuf::from(xdg).join("mailbox-ai")
     } else {
         home.join(".local/share/mailbox")
     }

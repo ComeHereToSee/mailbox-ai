@@ -107,7 +107,7 @@ final class CalendarService {
             }
             let ev = EKEvent(eventStore: store)
             ev.title = d.summary.subject.isEmpty ? "邮件日程" : d.summary.subject
-            ev.notes = "来自邮件：\(d.summary.from.full)\n\(d.summary.snippet)\n\nmailbox://message/\(d.id)"
+            ev.notes = "来自邮件：\(d.summary.from.full)\n\(d.summary.snippet)\n\nmailboxai://message/\(d.id)"
             let cal = Calendar.current
             let next = cal.nextDate(after: Date(), matching: DateComponents(minute: 0), matchingPolicy: .nextTime) ?? Date()
             ev.startDate = next
@@ -133,8 +133,8 @@ final class CalendarService {
             }
             let r = EKReminder(eventStore: store)
             r.title = "处理邮件：\(d.summary.subject.isEmpty ? d.summary.from.display : d.summary.subject)"
-            r.notes = "\(d.summary.from.full)\nmailbox://message/\(d.id)"
-            r.url = URL(string: "mailbox://message/\(d.id)")
+            r.notes = "\(d.summary.from.full)\nmailboxai://message/\(d.id)"
+            r.url = URL(string: "mailboxai://message/\(d.id)")
             let cal = Calendar.current
             let tomorrow = cal.date(byAdding: .day, value: 1, to: Date()) ?? Date()
             r.dueDateComponents = cal.dateComponents([.year, .month, .day, .hour, .minute],
@@ -276,7 +276,7 @@ enum LoginItem {
     }
 
     private static func installAgent() throws {
-        guard let helper = Daemon.helperURL else { throw APIError(status: 0, message: "找不到 MailboxHelper.app", code: "io") }
+        guard let helper = Daemon.helperURL else { throw APIError(status: 0, message: "找不到 MailboxAIHelper.app", code: "io") }
         let exe = helper.appendingPathComponent("Contents/MacOS/MailboxHelper").path
         let plist: [String: Any] = [
             "Label": Daemon.helperBundleId,

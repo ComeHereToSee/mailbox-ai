@@ -88,7 +88,7 @@ struct ThreadView: View {
         .sheet(isPresented: $showSource) {
             SourceView(messageId: messageId)
         }
-        .userActivity("com.comeheretosee.mailbox.message") { activity in
+        .userActivity("com.comeheretosee.mailbox.ai.message") { activity in
             activity.title = subject
             activity.userInfo = ["message_id": messageId]
             activity.isEligibleForHandoff = false

@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject private var state: AppState
-    /// Also set by `mailbox://settings?tab=…`.
+    /// Also set by `mailboxai://settings?tab=…`.
     @AppStorage("settingsTab") private var tab = "general"
 
     var body: some View {

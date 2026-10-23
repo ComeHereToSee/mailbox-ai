@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const KEYCHAIN_SERVICE: &str = "com.comeheretosee.mailbox";
+const KEYCHAIN_SERVICE: &str = "com.comeheretosee.mailbox.ai";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "master-key";
 

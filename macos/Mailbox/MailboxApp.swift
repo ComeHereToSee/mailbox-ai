@@ -7,7 +7,7 @@ struct MailboxApp: App {
     @StateObject private var state = AppState.shared
 
     var body: some Scene {
-        Window("Mailbox", id: "main") {
+        Window("Mailbox AI", id: "main") {
             MainView()
                 .environmentObject(state)
                 .frame(minWidth: 900, minHeight: 560)

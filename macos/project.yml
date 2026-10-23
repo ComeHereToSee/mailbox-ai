@@ -32,8 +32,8 @@ targets:
     info:
       path: Mailbox/Info.plist
       properties:
-        CFBundleDisplayName: Mailbox
-        CFBundleName: Mailbox
+        CFBundleDisplayName: Mailbox AI
+        CFBundleName: Mailbox AI
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.productivity
@@ -42,28 +42,28 @@ targets:
         CFBundleDevelopmentRegion: zh-Hans
         CFBundleLocalizations: [zh-Hans, en]
         CFBundleURLTypes:
-          - CFBundleURLName: com.comeheretosee.mailbox
-            CFBundleURLSchemes: [mailbox]
+          - CFBundleURLName: com.comeheretosee.mailbox.ai
+            CFBundleURLSchemes: [mailboxai]
           - CFBundleURLName: mailto
             CFBundleURLSchemes: [mailto]
-        NSCalendarsFullAccessUsageDescription: Mailbox 需要访问日历，以便把会议邀请和邮件中的日程加入日历。
-        NSCalendarsWriteOnlyAccessUsageDescription: Mailbox 需要写入日历，以便把会议邀请加入日历。
-        NSRemindersFullAccessUsageDescription: Mailbox 需要访问提醒事项，以便从邮件创建待办提醒。
-        NSContactsUsageDescription: Mailbox 使用通讯录补全收件人。
-        NSUserActivityTypes: [com.comeheretosee.mailbox.message]
+        NSCalendarsFullAccessUsageDescription: Mailbox AI 需要访问日历，以便把会议邀请和邮件中的日程加入日历。
+        NSCalendarsWriteOnlyAccessUsageDescription: Mailbox AI 需要写入日历，以便把会议邀请加入日历。
+        NSRemindersFullAccessUsageDescription: Mailbox AI 需要访问提醒事项，以便从邮件创建待办提醒。
+        NSContactsUsageDescription: Mailbox AI 使用通讯录补全收件人。
+        NSUserActivityTypes: [com.comeheretosee.mailbox.ai.message]
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         NSServices:
           - NSMenuItem:
-              default: 用 Mailbox 发送
+              default: 用 Mailbox AI 发送
             NSMessage: composeWithSelection
-            NSPortName: Mailbox
+            NSPortName: MailboxAI
             NSSendTypes: [NSStringPboardType, public.plain-text, public.file-url, NSFilenamesPboardType]
             NSRequiredContext: {}
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox
-        PRODUCT_NAME: Mailbox
+        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox.ai
+        PRODUCT_NAME: MailboxAI
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Mailbox/Mailbox.entitlements
         INFOPLIST_KEY_NSHumanReadableCopyright: "© ComeHereToSee"
@@ -87,8 +87,8 @@ targets:
     info:
       path: MailboxHelper/Info.plist
       properties:
-        CFBundleDisplayName: Mailbox Helper
-        CFBundleName: MailboxHelper
+        CFBundleDisplayName: Mailbox AI Helper
+        CFBundleName: MailboxAIHelper
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSUIElement: true
@@ -99,8 +99,8 @@ targets:
         CFBundleURLTypes: []
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox.helper
-        PRODUCT_NAME: MailboxHelper
+        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox.ai.helper
+        PRODUCT_NAME: MailboxAIHelper
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SKIP_INSTALL: YES
         SWIFT_OBJC_BRIDGING_HEADER: MailboxHelper/Bridging-Header.h
@@ -115,7 +115,7 @@ targets:
     info:
       path: ShareExtension/Info.plist
       properties:
-        CFBundleDisplayName: Mailbox
+        CFBundleDisplayName: Mailbox AI
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
@@ -135,8 +135,8 @@ targets:
         com.apple.security.files.user-selected.read-only: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox.share
-        PRODUCT_NAME: MailboxShare
+        PRODUCT_BUNDLE_IDENTIFIER: com.comeheretosee.mailbox.ai.share
+        PRODUCT_NAME: MailboxAIShare
         SKIP_INSTALL: YES
 schemes:
   Mailbox:

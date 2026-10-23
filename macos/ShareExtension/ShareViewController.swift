@@ -80,7 +80,7 @@ final class ShareViewController: NSViewController {
 
         group.notify(queue: .main) { [weak self] in
             var comps = URLComponents()
-            comps.scheme = "mailbox"
+            comps.scheme = "mailboxai"
             comps.host = "compose"
             var query: [URLQueryItem] = []
             if let s = out.subject { query.append(URLQueryItem(name: "subject", value: s)) }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds Mailbox.app (ad-hoc signed) and dist/Mailbox.dmg.
+# Builds MailboxAI.app (ad-hoc signed) and dist/MailboxAI.dmg.
 # Requirements: Xcode 16+, Rust (rustup), XcodeGen (brew install xcodegen).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,8 +28,8 @@ if [ "$status" -ne 0 ]; then
   exit "$status"
 fi
 
-APP="$DERIVED/Build/Products/$CONFIG/Mailbox.app"
-test -d "$APP/Contents/Library/LoginItems/MailboxHelper.app"
+APP="$DERIVED/Build/Products/$CONFIG/MailboxAI.app"
+test -d "$APP/Contents/Library/LoginItems/MailboxAIHelper.app"
 echo "== codesign verify"
 codesign --verify --deep --strict "$APP" && echo "signature ok" || echo "signature verification failed (ad-hoc build)" >&2
 
@@ -37,13 +37,13 @@ mkdir -p "$ROOT/dist"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-rm -f "$ROOT/dist/Mailbox.dmg"
+rm -f "$ROOT/dist/MailboxAI.dmg"
 echo "== hdiutil"
 for attempt in 1 2 3; do
-  if hdiutil create -volname "Mailbox" -srcfolder "$STAGE" -ov -format UDZO "$ROOT/dist/Mailbox.dmg" >/dev/null; then break; fi
+  if hdiutil create -volname "Mailbox AI" -srcfolder "$STAGE" -ov -format UDZO "$ROOT/dist/MailboxAI.dmg" >/dev/null; then break; fi
   echo "hdiutil failed, retrying" >&2
   sleep 5
 done
 rm -rf "$STAGE"
-du -h "$ROOT/dist/Mailbox.dmg"
+du -h "$ROOT/dist/MailboxAI.dmg"
 echo "Built $APP"

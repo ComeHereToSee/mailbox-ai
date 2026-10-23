@@ -13,7 +13,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func setup() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let image = NSImage(systemSymbolName: "envelope", accessibilityDescription: "Mailbox")
+        let image = NSImage(systemSymbolName: "envelope", accessibilityDescription: "Mailbox AI")
         image?.isTemplate = true
         item.button?.image = image
         item.button?.imagePosition = .imageLeading
@@ -27,7 +27,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func showError(_ message: String) {
         engineError = message
-        item?.button?.image = NSImage(systemSymbolName: "envelope.badge.shield.half.filled", accessibilityDescription: "Mailbox")
+        item?.button?.image = NSImage(systemSymbolName: "envelope.badge.shield.half.filled", accessibilityDescription: "Mailbox AI")
         item?.button?.toolTip = message
     }
 
@@ -35,14 +35,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statuses[status.accountId] = status
         let failing = statuses.values.contains { $0.state == .error }
         let name = failing ? "envelope.badge.shield.half.filled" : (unread > 0 ? "envelope.badge" : "envelope")
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "Mailbox")
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: "Mailbox AI")
         image?.isTemplate = true
         item?.button?.image = image
     }
 
     private func updateButton() {
         item?.button?.title = unread > 0 ? " \(unread)" : ""
-        item?.button?.toolTip = unread > 0 ? "Mailbox：\(unread) 封未读" : "Mailbox"
+        item?.button?.toolTip = unread > 0 ? "Mailbox AI：\(unread) 封未读" : "Mailbox AI"
     }
 
     @MainActor
@@ -92,7 +92,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         pause.submenu = sub
         menu.addItem(pause)
         menu.addItem(.separator())
-        menu.addItem(action("打开 Mailbox", #selector(openApp), "o"))
+        menu.addItem(action("打开 Mailbox AI", #selector(openApp), "o"))
         menu.addItem(.separator())
         menu.addItem(action("退出（停止收信）", #selector(quit), "q"))
     }
@@ -126,12 +126,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openMessage(_ sender: NSMenuItem) {
-        guard let id = (sender.representedObject as? NSNumber)?.int64Value, let url = URL(string: "mailbox://message/\(id)") else { return }
+        guard let id = (sender.representedObject as? NSNumber)?.int64Value, let url = URL(string: "mailboxai://message/\(id)") else { return }
         Daemon.openMainApp(url: url)
     }
 
     @objc private func compose() {
-        if let url = URL(string: "mailbox://compose") { Daemon.openMainApp(url: url) }
+        if let url = URL(string: "mailboxai://compose") { Daemon.openMainApp(url: url) }
     }
 
     @objc private func openApp() {

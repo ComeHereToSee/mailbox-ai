@@ -435,7 +435,7 @@ final class AppState: ObservableObject {
             compose(Self.composeRequest(mailto: url))
             return
         }
-        guard url.scheme == "mailbox" else { return }
+        guard url.scheme == "mailboxai" else { return }
         let parts = url.pathComponents.filter { $0 != "/" }
         switch url.host {
         case "message":

@@ -158,7 +158,7 @@ impl Engine {
             subject: summary.subject.clone(),
             snippet: summary.snippet.clone(),
             date: summary.date,
-            message_url: Some(format!("mailbox://message/{}", summary.id)),
+            message_url: Some(format!("mailboxai://message/{}", summary.id)),
         };
         for f in forwarders {
             if !f.enabled || (f.vip_only && !vip) || (!f.accounts.is_empty() && !f.accounts.contains(&acc.id)) {

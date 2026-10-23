@@ -71,7 +71,7 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
             case UNNotificationDismissActionIdentifier:
                 break
             default:
-                if let url = URL(string: "mailbox://message/\(id)") {
+                if let url = URL(string: "mailboxai://message/\(id)") {
                     await MainActor.run { Daemon.openMainApp(url: url) }
                 }
             }

@@ -3,20 +3,20 @@ import Foundation
 
 /// Locating and launching the background helper that hosts the mail engine.
 enum Daemon {
-    static let helperBundleId = "com.comeheretosee.mailbox.helper"
-    static let appBundleId = "com.comeheretosee.mailbox"
+    static let helperBundleId = "com.comeheretosee.mailbox.ai.helper"
+    static let appBundleId = "com.comeheretosee.mailbox.ai"
 
     static var dataDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("Mailbox", isDirectory: true)
+        return base.appendingPathComponent("Mailbox AI", isDirectory: true)
     }
 
     static var infoURL: URL { dataDir.appendingPathComponent("daemon.json") }
 
     /// The helper app inside the main bundle (Contents/Library/LoginItems).
     static var helperURL: URL? {
-        let fromApp = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LoginItems/MailboxHelper.app")
+        let fromApp = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LoginItems/MailboxAIHelper.app")
         if FileManager.default.fileExists(atPath: fromApp.path) { return fromApp }
         return NSWorkspace.shared.urlForApplication(withBundleIdentifier: helperBundleId)
     }

@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub const DEFAULT_PORT: u16 = 47920;
+pub const DEFAULT_PORT: u16 = 47921;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
