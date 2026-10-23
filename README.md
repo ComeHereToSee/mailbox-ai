@@ -8,9 +8,13 @@
 
 ![主界面：AI 会话摘要与智能提醒](docs/screenshots/main.png)
 
-| AI 服务（Cherry Studio 风格） | AI 功能 | ✨ 待处理 | AI 助手 |
-|---|---|---|---|
-| ![AI 服务](docs/screenshots/ai-providers.png) | ![AI 功能](docs/screenshots/ai-features.png) | ![待处理](docs/screenshots/pending.png) | ![AI 助手](docs/screenshots/assistant.png) |
+| AI 服务（Cherry Studio 风格） | AI 功能 | ✨ 待处理（截止、钓鱼、跟进） |
+|---|---|---|
+| ![AI 服务](docs/screenshots/ai-providers.png) | ![AI 功能](docs/screenshots/ai-features.png) | ![待处理](docs/screenshots/pending.png) |
+
+| 内置 MCP 服务 | 用量统计 | AI 助手 |
+|---|---|---|
+| ![MCP](docs/screenshots/ai-mcp.png) | ![用量](docs/screenshots/ai-usage.png) | ![AI 助手](docs/screenshots/assistant.png) |
 
 <sub>截图由 CI 在 macOS 15 上用演示数据（`--demo`）自动拍摄。</sub>
 
