@@ -499,6 +499,8 @@ pub struct Draft {
     pub sign: bool,
     pub encrypt: bool,
     pub updated_at: i64,
+    /// Written by an AI auto reply rule: adds `Auto-Submitted: auto-replied` (RFC 3834).
+    pub auto_submitted: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]

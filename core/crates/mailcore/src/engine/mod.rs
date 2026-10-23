@@ -4,7 +4,7 @@
 mod accounts;
 mod actions;
 mod demo;
-mod detail;
+pub(crate) mod detail;
 mod extras;
 mod imap_worker;
 mod keys;
@@ -75,6 +75,8 @@ pub struct Inner {
     pub api_port: AtomicU16,
     shutdown: CancellationToken,
     pub(crate) http: reqwest::Client,
+    /// AI features: batch jobs, the new-mail analysis queue, running loops.
+    pub(crate) ai: crate::ai::AiState,
 }
 
 /// Cheap to clone handle to the engine.
@@ -124,6 +126,7 @@ impl Engine {
             api_port: AtomicU16::new(0),
             shutdown: CancellationToken::new(),
             http: crate::forward::http_client(),
+            ai: crate::ai::AiState::new(),
         })))
     }
 
@@ -136,6 +139,7 @@ impl Engine {
         tokio::spawn(async move { e.outbox_loop().await });
         let e = self.clone();
         tokio::spawn(async move { e.housekeeping_loop().await });
+        crate::ai::start(self);
     }
 
     pub async fn shutdown(&self) {
@@ -392,6 +396,8 @@ impl Engine {
                     self.changed(None);
                 }
             }
+            // Smart reminders and scheduled AI loops (checked once a minute).
+            crate::ai::tick(self);
             self.undo.lock().retain(|_, u| u.created.elapsed() < Duration::from_secs(60));
             self.oauth_pending.lock().retain(|_, p| p.created.elapsed() < Duration::from_secs(1800));
             let idle: Vec<ConnSlot> = self.ondemand.lock().values().cloned().collect();

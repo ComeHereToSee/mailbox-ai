@@ -63,6 +63,8 @@ pub(super) async fn process(e: &Engine, acc: &Account, mut conn: Option<&mut Ima
         }
         let summary = e.db.message(*id).map(|m| m.summary).unwrap_or(m.summary);
         e.notify_message(&summary, out.notify).await;
+        // Smart reminders / auto replies run in a background queue (never blocks sync).
+        e.ai_enqueue(*id);
     }
     e.changed(Some(&acc.id));
 }

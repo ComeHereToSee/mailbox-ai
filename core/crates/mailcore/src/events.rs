@@ -26,6 +26,16 @@ pub enum Event {
     SettingsChanged,
     /// A snoozed message came back to the inbox.
     Snoozed { message_id: i64 },
+    /// Smart analysis (insight) of a message was stored or changed.
+    AiInsight { message_id: i64 },
+    /// A smart reminder is due: the helper shows a notification opening the message.
+    AiReminder { message_id: i64, title: String, body: String },
+    /// Progress of an AI batch job.
+    AiJob { job_id: String, done: usize, total: usize, status: String },
+    /// An AI loop run finished. `preview` is the first 120 characters of the output as plain text.
+    AiLoop { loop_id: String, run_id: String, name: String, status: String, preview: String },
+    /// An auto reply was drafted (`draft_id`) or queued for sending (`sent`).
+    AiAutoreply { message_id: i64, rule_name: String, draft_id: Option<String>, sent: bool, subject: String },
 }
 
 #[derive(Clone)]

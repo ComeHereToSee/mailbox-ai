@@ -94,6 +94,7 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/keys/{id}", delete(delete_key))
         .route("/v1/keys/{id}/export", get(export_key))
         .route("/v1/keys/{id}/passphrase", post(key_passphrase))
+        .merge(super::ai::router())
         .with_state(state)
 }
 

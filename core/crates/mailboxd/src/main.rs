@@ -44,6 +44,7 @@ async fn main() {
     engine.start();
     if demo {
         let _ = engine.seed_demo();
+        let _ = engine.ai_seed_demo();
     }
     println!("mailboxd {} listening on http://127.0.0.1:{} (data: {})", env!("CARGO_PKG_VERSION"), handle.port, data_dir.display());
     let _ = tokio::signal::ctrl_c().await;

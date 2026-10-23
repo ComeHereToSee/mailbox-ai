@@ -24,6 +24,15 @@ pub enum Error {
     Invalid(String),
     #[error("{0}")]
     Other(String),
+    /// An AI provider or local AI command line failed.
+    #[error("{0}")]
+    Ai(String),
+    /// No usable AI model is configured (HTTP 400, code `ai_not_configured`).
+    #[error("{0}")]
+    AiNotConfigured(String),
+    /// The request may not be sent to an AI model (e.g. an encrypted message).
+    #[error("{0}")]
+    AiRefused(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -83,6 +92,9 @@ impl Error {
             Error::NotFound(_) => "not_found",
             Error::Invalid(_) => "invalid",
             Error::Other(_) => "other",
+            Error::Ai(_) => "ai",
+            Error::AiNotConfigured(_) => "ai_not_configured",
+            Error::AiRefused(_) => "ai_refused",
         }
     }
 }

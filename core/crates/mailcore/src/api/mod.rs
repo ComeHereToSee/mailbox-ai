@@ -1,6 +1,7 @@
 //! Local HTTP API (127.0.0.1 only) used by the macOS app, the menu bar helper and the
 //! share extension. Every request needs the per-launch token from `daemon.json`.
 
+mod ai;
 mod routes;
 
 use crate::Engine;
@@ -51,9 +52,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            Error::Invalid(_) | Error::AiNotConfigured(_) | Error::AiRefused(_) => StatusCode::BAD_REQUEST,
             Error::Auth(_) | Error::OAuth(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Error::Net(_) | Error::Imap(_) | Error::Smtp(_) | Error::Pop3(_) => StatusCode::BAD_GATEWAY,
+            Error::Net(_) | Error::Imap(_) | Error::Smtp(_) | Error::Pop3(_) | Error::Ai(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = serde_json::json!({ "error": self.0.to_string(), "code": self.0.code() });

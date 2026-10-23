@@ -230,6 +230,9 @@ impl Engine {
                 if acc.kind == AccountKind::Imap {
                     let _ = self.db.enqueue_op(&acc.id, &OpKind::Flags { message_ids: vec![src], flag: flag.into(), add: true });
                 }
+                if flag == "answered" {
+                    crate::ai::insight::mark_answered(self, src);
+                }
             }
         }
         let _ = self.db.delete_draft(&d.id);
@@ -375,6 +378,10 @@ impl Engine {
         let mut extra_headers = Vec::new();
         if for_draft {
             extra_headers.push(("X-Mailbox-Draft-Id".to_string(), d.id.clone()));
+        }
+        if d.auto_submitted {
+            // RFC 3834: keeps other auto responders from answering our auto reply.
+            extra_headers.push(("Auto-Submitted".to_string(), "auto-replied".to_string()));
         }
         let o = Outgoing {
             from,

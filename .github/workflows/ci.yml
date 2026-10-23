@@ -57,7 +57,7 @@ jobs:
         run: scripts/build-macos.sh
       - name: Screenshots with demo data
         if: success()
-        timeout-minutes: 6
+        timeout-minutes: 8
         run: |
           APP="$PWD/macos/build/DerivedData/Build/Products/Release/MailboxAI.app"
           mkdir -p /tmp/shots
@@ -76,6 +76,22 @@ jobs:
           open "mailboxai://settings?tab=crypto"
           sleep 5
           screencapture -x /tmp/shots/5-crypto.png || true
+          # AI features (demo data from POST /v1/ai/demo; message 2 has a cached summary).
+          open "mailboxai://message/2"
+          sleep 6
+          screencapture -x /tmp/shots/6-ai-reader.png || true
+          open "mailboxai://settings?tab=ai"
+          sleep 5
+          screencapture -x /tmp/shots/7-ai-providers.png || true
+          open "mailboxai://settings?tab=ai_features"
+          sleep 5
+          screencapture -x /tmp/shots/8-ai-features.png || true
+          open "mailboxai://assistant"
+          sleep 5
+          screencapture -x /tmp/shots/9-assistant.png || true
+          open "mailboxai://pending"
+          sleep 5
+          screencapture -x /tmp/shots/10-pending.png || true
           tail -30 /tmp/app.log || true
           tail -30 "$HOME/Library/Application Support/Mailbox AI/logs/mailcore.log" || true
       - name: Upload screenshots
