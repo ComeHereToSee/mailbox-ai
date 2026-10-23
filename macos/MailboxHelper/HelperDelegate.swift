@@ -56,8 +56,16 @@ final class HelperDelegate: NSObject, NSApplicationDelegate {
             if status == .failed, let error {
                 notifications.postSendFailure(error)
             }
-        case .aiInsight:
+        case let .aiInsight(messageId):
             scheduleMenuRefresh()
+            annotateIfNeeded(messageId)
+        case let .aiNotify(messageId, title, subtitle, body):
+            // notify_mode "important": the engine held back the new-mail notification until the analysis finished.
+            notifications.postMail(messageId: messageId, title: title, subtitle: subtitle, body: body)
+            scheduleMenuRefresh()
+        case let .aiConfirm(id, kind, title, detail):
+            // Also answerable from here when the main app is closed; the first decision wins.
+            notifications.postConfirm(id: id, kind: kind, title: title, detail: detail)
         case let .aiReminder(messageId, title, body):
             notifications.postAI(identifier: "ai-reminder-\(messageId)", title: title.isEmpty ? "⏰ 待处理邮件" : title, body: body,
                                  url: "mailboxai://message/\(messageId)", timeSensitive: true)
@@ -68,6 +76,16 @@ final class HelperDelegate: NSObject, NSApplicationDelegate {
             postAutoReply(messageId: messageId, ruleName: ruleName, draftId: draftId, sent: sent, subject: subject)
         default:
             break
+        }
+    }
+
+    /// notify_mode "annotate": add "✨ one_line" to the mail notification if it is still in Notification Center.
+    private func annotateIfNeeded(_ messageId: Int64) {
+        let notifications = self.notifications
+        Task {
+            guard let settings = try? await APIClient.shared.aiSettings(), settings.notifyMode == "annotate",
+                  let insight = try? await APIClient.shared.aiInsight(messageId), !insight.oneLine.isEmpty else { return }
+            await notifications.annotate(messageId: messageId, oneLine: insight.oneLine)
         }
     }
 

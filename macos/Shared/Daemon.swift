@@ -21,6 +21,14 @@ enum Daemon {
         return NSWorkspace.shared.urlForApplication(withBundleIdentifier: helperBundleId)
     }
 
+    /// Executable name of the helper (`PRODUCT_NAME` of the MailboxHelper target).
+    static let helperExecutableName = "MailboxAIHelper"
+
+    /// The helper's executable; `MailboxAIHelper --mcp` is the stdio MCP bridge (docs/AI.md §8.2).
+    static var helperExecutableURL: URL? {
+        helperURL?.appendingPathComponent("Contents/MacOS/\(helperExecutableName)")
+    }
+
     /// The main app (from inside the helper bundle).
     static var mainAppURL: URL? {
         var url = Bundle.main.bundleURL

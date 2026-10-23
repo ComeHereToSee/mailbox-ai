@@ -45,6 +45,9 @@ enum AIComposeOp: String, CaseIterable, Identifiable {
 @MainActor
 final class ComposeAIModel: ObservableObject {
     let stream = AIStreamModel()
+    /// "生成主题" (op `subject`, §8.4): the result goes straight into the subject field.
+    let subjectStream = AIStreamModel()
+    private weak var subjectTarget: ComposeModel?
 
     @Published var visible = false
     @Published var op: AIComposeOp = .polish
@@ -56,18 +59,27 @@ final class ComposeAIModel: ObservableObject {
     @Published var sourceText = ""
     /// Write / custom: waiting for the user to type an instruction.
     @Published var awaitingInstruction = false
+    /// Name of the saved prompt being run ("我的提示词").
+    @Published var presetName: String?
+
+    init() {
+        subjectStream.onDone = { [weak self] line in self?.applyGeneratedSubject(line) }
+    }
 
     var title: String {
         if op == .translate { return targetLang == "en" ? "翻译成英文" : "翻译成中文" }
+        if op == .custom, let presetName, !presetName.isEmpty { return presetName }
         return op.title
     }
 
     /// Opens the panel for `op`, capturing the selection (or the body) first.
-    func begin(_ op: AIComposeOp, targetLang: String? = nil, instruction: String? = nil, compose: ComposeModel) async {
+    func begin(_ op: AIComposeOp, targetLang: String? = nil, instruction: String? = nil, presetName: String? = nil,
+               compose: ComposeModel) async {
         stream.reset()
         let previous = self.op
         self.op = op
         self.targetLang = targetLang
+        self.presetName = presetName
         if let instruction {
             self.instruction = instruction
         } else if previous != op || !op.needsInstruction {
@@ -168,7 +180,52 @@ final class ComposeAIModel: ObservableObject {
         visible = false
         awaitingInstruction = false
         emptyBody = false
+        presetName = nil
         if op == .reply { quickReply = "" }
+    }
+
+    // MARK: Subject
+
+    /// Generates a one-line subject from the body (the caller confirms overwriting a non-empty subject).
+    func generateSubject(compose: ComposeModel) async {
+        let text: String
+        if compose.markdownMode {
+            text = compose.markdownText
+        } else {
+            text = await compose.editor.bodyText()
+        }
+        subjectStream.reset()
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "正文是空的"
+            alert.informativeText = "先写好正文，再让 AI 生成主题。"
+            alert.runModal()
+            return
+        }
+        subjectTarget = compose
+        subjectStream.start("/v1/ai/compose", body: AIComposeBody(op: "subject", text: text, instruction: nil, targetLang: nil, messageId: nil))
+    }
+
+    private func applyGeneratedSubject(_ line: AIStreamLine) {
+        guard let compose = subjectTarget else { return }
+        subjectTarget = nil
+        let fromDone = line.subject?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let raw = !fromDone.isEmpty ? fromDone : (line.text ?? subjectStream.text)
+        let subject = Self.cleanSubject(raw)
+        guard !subject.isEmpty else { return }
+        compose.draft.subject = subject
+        compose.markDirty()
+    }
+
+    /// First non-empty line, without a "主题：" prefix or surrounding quotes.
+    nonisolated static func cleanSubject(_ raw: String) -> String {
+        var s = raw.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+        for prefix in ["主题：", "主题:", "Subject:", "subject:"] where s.hasPrefix(prefix) {
+            s = String(s.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+        }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’「」『』《》*"))
     }
 }
 
@@ -178,6 +235,7 @@ final class ComposeAIModel: ObservableObject {
 struct AIComposeMenu: View {
     @ObservedObject var ai: ComposeAIModel
     @ObservedObject var compose: ComposeModel
+    @ObservedObject private var aiState = AIState.shared
 
     var body: some View {
         Menu {
@@ -194,6 +252,21 @@ struct AIComposeMenu: View {
                     Button { start(.reply) } label: { Label("一键回复…", systemImage: AIComposeOp.reply.symbol) }
                 }
                 Button { start(.custom) } label: { Label("自定义指令…", systemImage: AIComposeOp.custom.symbol) }
+                Menu {
+                    ForEach(aiState.promptList(scope: "compose")) { p in
+                        Button(p.name) {
+                            Task { await ai.begin(.custom, instruction: p.prompt, presetName: p.name, compose: compose) }
+                        }
+                    }
+                    if !aiState.promptList(scope: "compose").isEmpty { Divider() }
+                    Button("管理提示词…") { AIState.openSettings(tab: "ai_features", pane: "prompts") }
+                } label: {
+                    Label("我的提示词", systemImage: "text.book.closed")
+                }
+            }
+            Section {
+                Button { generateSubject() } label: { Label("生成主题", systemImage: "textformat") }
+                    .disabled(ai.subjectStream.running)
             }
         } label: {
             Label("AI", systemImage: "sparkles")
@@ -206,6 +279,41 @@ struct AIComposeMenu: View {
 
     private func start(_ op: AIComposeOp, lang: String? = nil) {
         Task { await ai.begin(op, targetLang: lang, compose: compose) }
+    }
+
+    /// Asks before replacing a subject the user already typed.
+    private func generateSubject() {
+        let current = compose.draft.subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "用 AI 生成的主题替换现在的主题？"
+            alert.informativeText = "现在的主题：\(current)"
+            alert.addButton(withTitle: "生成并替换")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Task { await ai.generateSubject(compose: compose) }
+    }
+}
+
+/// Progress / error of "生成主题", shown next to the subject field.
+struct AISubjectIndicator: View {
+    @ObservedObject var stream: AIStreamModel
+
+    var body: some View {
+        if stream.running {
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.small)
+                Text("AI 正在生成主题…").font(.caption).foregroundStyle(.secondary)
+            }
+            .fixedSize()
+        } else if let err = stream.error {
+            Label("生成主题失败", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .help(err)
+                .fixedSize()
+        }
     }
 }
 

@@ -125,6 +125,60 @@ final class CalendarService {
         }
     }
 
+    /// Writes events extracted by AI (docs/AI.md §8.1) to the default calendar; returns how many were saved.
+    @discardableResult
+    func addEvents(_ items: [AIExtractedEvent], messageId: Int64?) async -> Int {
+        guard !items.isEmpty else { return 0 }
+        guard await eventsAccess() else {
+            AppState.shared.show(Toast(text: "没有日历权限（系统设置 → 隐私与安全性 → 日历）", isError: true))
+            return 0
+        }
+        let cal = Calendar.current
+        var saved = 0
+        var failure: String?
+        for item in items {
+            let ev = EKEvent(eventStore: store)
+            ev.title = item.title.trimmingCharacters(in: .whitespaces).isEmpty ? "邮件日程" : item.title
+            if let loc = item.location?.trimmingCharacters(in: .whitespaces), !loc.isEmpty { ev.location = loc }
+            var notes: [String] = []
+            if !item.notes.isEmpty { notes.append(item.notes) }
+            if !item.sourceText.isEmpty { notes.append("原文：\(item.sourceText)") }
+            if let id = messageId { notes.append("mailboxai://message/\(id)") }
+            ev.notes = notes.joined(separator: "\n")
+            if let id = messageId { ev.url = URL(string: "mailboxai://message/\(id)") }
+            var start = Date(timeIntervalSince1970: TimeInterval(item.start))
+            var end = item.end.map { Date(timeIntervalSince1970: TimeInterval($0)) } ?? start.addingTimeInterval(3600)
+            ev.isAllDay = item.allDay
+            if item.allDay {
+                start = cal.startOfDay(for: start)
+                end = max(cal.startOfDay(for: end), start)
+            } else if end <= start {
+                end = start.addingTimeInterval(3600)
+            }
+            ev.startDate = start
+            ev.endDate = end
+            ev.calendar = store.defaultCalendarForNewEvents
+            do {
+                try store.save(ev, span: .thisEvent, commit: false)
+                saved += 1
+            } catch {
+                failure = error.localizedDescription
+            }
+        }
+        do {
+            try store.commit()
+        } catch {
+            failure = error.localizedDescription
+            saved = 0
+        }
+        if saved > 0 {
+            AppState.shared.show(Toast(text: saved == 1 ? "已加入日历" : "已把 \(saved) 个日程加入日历"))
+        } else if let failure {
+            AppState.shared.show(Toast(text: "加入日历失败：\(failure)", isError: true))
+        }
+        return saved
+    }
+
     func addReminder(from d: MessageDetail) {
         Task {
             guard await remindersAccess() else {
@@ -277,7 +331,7 @@ enum LoginItem {
 
     private static func installAgent() throws {
         guard let helper = Daemon.helperURL else { throw APIError(status: 0, message: "找不到 MailboxAIHelper.app", code: "io") }
-        let exe = helper.appendingPathComponent("Contents/MacOS/MailboxHelper").path
+        let exe = helper.appendingPathComponent("Contents/MacOS/\(Daemon.helperExecutableName)").path
         let plist: [String: Any] = [
             "Label": Daemon.helperBundleId,
             "ProgramArguments": [exe],

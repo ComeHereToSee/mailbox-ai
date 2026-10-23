@@ -12,6 +12,9 @@ final class AssistantModel: ObservableObject {
         var text: String
         var sources: [AISource] = []
         var model: String?
+        /// External MCP tools the answer used (§8.3).
+        var toolCalls: [AIToolCall] = []
+        var toolsNote: String? = nil
     }
 
     /// A message the user is reading, passed as context ("问问 AI").
@@ -37,13 +40,18 @@ final class AssistantModel: ObservableObject {
     @Published var runs: [AILoopRun] = []
     @Published var loadingRuns = false
     @Published var runningLoop: String?
+    /// "🔧 使用工具": let the model call the enabled external MCP servers.
+    @Published var useTools = UserDefaults.standard.bool(forKey: "assistantUseTools") {
+        didSet { UserDefaults.standard.set(useTools, forKey: "assistantUseTools") }
+    }
 
     let stream = AIStreamModel()
 
     init() {
         stream.onDone = { [weak self] line in
             guard let self else { return }
-            self.entries.append(Entry(role: "assistant", text: self.stream.text, sources: line.sources ?? [], model: line.model))
+            self.entries.append(Entry(role: "assistant", text: self.stream.text, sources: line.sources ?? [], model: line.model,
+                                      toolCalls: line.toolCalls ?? [], toolsNote: line.toolsNote))
             self.stream.reset()
         }
     }
@@ -72,9 +80,9 @@ final class AssistantModel: ObservableObject {
             \(ctx.text)
             """
             let history = entries.suffix(12).map { AIChatMessage(role: $0.role, content: $0.text) }
-            stream.start("/v1/ai/chat", body: AIChatBody(model: nil, system: system, messages: Array(history)))
+            stream.start("/v1/ai/chat", body: AIChatBody(model: nil, system: system, messages: Array(history), tools: useTools))
         } else {
-            stream.start("/v1/ai/ask", body: AIAskBody(question: q, mailbox: nil))
+            stream.start("/v1/ai/ask", body: AIAskBody(question: q, mailbox: nil, tools: useTools))
         }
     }
 
@@ -231,6 +239,12 @@ private struct AssistantChatView: View {
                 .padding(.top, 8)
             }
             HStack(alignment: .bottom, spacing: 8) {
+                Toggle(isOn: $model.useTools) {
+                    Text("🔧 使用工具")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help("允许 AI 调用 设置 → AI 功能 → MCP 中启用的外部工具")
                 TextField(model.context == nil ? "问问你的邮箱，例如：上次张三说的报价是多少？" : "关于这封邮件，想问什么？",
                           text: $model.input, axis: .vertical)
                     .lineLimit(1...5)
@@ -308,6 +322,19 @@ private struct AssistantChatView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                    }
+                    if !e.toolCalls.isEmpty {
+                        FlowLayout(spacing: 4) {
+                            Text("🔧 调用的工具").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            ForEach(Array(e.toolCalls.enumerated()), id: \.offset) { _, t in
+                                AIChip(text: t.server.isEmpty ? t.tool : "\(t.server) · \(t.tool)",
+                                       symbol: t.ok ? "checkmark" : "xmark", color: t.ok ? .teal : .red)
+                                    .help(t.ok ? "调用成功" : "调用失败")
+                            }
+                        }
+                    }
+                    if let note = e.toolsNote, !note.isEmpty {
+                        Label(note, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
                     }
                     HStack(spacing: 10) {
                         Button {

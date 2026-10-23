@@ -73,7 +73,9 @@ struct ThreadView: View {
                     ForEach(details) { d in
                         MessageCard(detail: d, expanded: expanded.contains(d.id) || details.count == 1, onToggle: {
                             if expanded.contains(d.id) { expanded.remove(d.id) } else { expanded.insert(d.id) }
-                        }, onReload: { Task { await load() } })
+                        }, onReload: { Task { await load() } }, onExplain: { a in
+                            aiModel.explainAttachment(messageId: d.id, attachment: a)
+                        })
                     }
                     AISuggestedReplies(model: aiModel, messageId: messageId)
                 } else if loading {
@@ -99,6 +101,9 @@ struct ThreadView: View {
         .sheet(isPresented: $showSource) {
             SourceView(messageId: messageId)
         }
+        .sheet(isPresented: $aiModel.showEvents) {
+            AIEventsSheet(messageId: messageId, subject: subject)
+        }
         .userActivity("com.comeheretosee.mailbox.ai.message") { activity in
             activity.title = subject
             activity.userInfo = ["message_id": messageId]
@@ -122,7 +127,8 @@ struct ThreadView: View {
                     if details.count > 1 { Text("\(details.count) 封邮件").font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            AIInsightChips(messageId: messageId)
+            AIInsightChips(messageId: messageId, onEvents: { aiModel.showEvents = true })
+            AIRiskBanner(messageId: messageId)
         }
         .padding(.bottom, 4)
     }
@@ -144,7 +150,7 @@ struct ThreadView: View {
             } label: {
                 Label("星标", systemImage: current?.summary.flags.flagged == true ? "star.fill" : "star")
             }
-            AIReaderMenu(model: aiModel, messageId: messageId, current: current, threadCount: details.count)
+            AIReaderMenu(model: aiModel, messageId: messageId, current: current, threadCount: details.count, details: details)
             Menu {
                 moreMenu
             } label: {
@@ -226,6 +232,8 @@ struct MessageCard: View {
     let expanded: Bool
     let onToggle: () -> Void
     let onReload: () -> Void
+    /// "AI 解读附件" (shown in the attachment context menu when set).
+    var onExplain: ((Attachment) -> Void)? = nil
     @State private var height: CGFloat = 80
     @State private var showRemote = false
     @State private var showDetails = false
@@ -246,7 +254,7 @@ struct MessageCard: View {
                     Text(detail.warnings.first ?? "正文加载中…").foregroundStyle(.secondary)
                 }
                 if !detail.attachments.filter({ !$0.inline }).isEmpty {
-                    AttachmentStrip(messageId: detail.id, attachments: detail.attachments.filter { !$0.inline })
+                    AttachmentStrip(messageId: detail.id, attachments: detail.attachments.filter { !$0.inline }, onExplain: onExplain)
                 }
                 if let invite = detail.invite {
                     InviteCard(messageId: detail.id, invite: invite)
@@ -399,6 +407,7 @@ struct AttachmentStrip: View {
     @EnvironmentObject private var state: AppState
     let messageId: Int64
     let attachments: [Attachment]
+    var onExplain: ((Attachment) -> Void)? = nil
     @State private var previewURL: URL?
 
     var body: some View {
@@ -434,6 +443,10 @@ struct AttachmentStrip: View {
                             Task { if let url = try? await state.api.attachmentFile(messageId, a.id) { NSWorkspace.shared.open(url) } }
                         }
                         Button("存储为…") { Task { await save(a) } }
+                        if let onExplain {
+                            Divider()
+                            Button("AI 解读附件") { onExplain(a) }
+                        }
                     }
                     .onDrag { dragProvider(for: a) }
                 }

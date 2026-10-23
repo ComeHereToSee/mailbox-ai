@@ -12,25 +12,33 @@ struct AIFeaturesSettings: View {
                 Text("常规").tag("general")
                 Text("自动回复").tag("autoreply")
                 Text("Loop 定时任务").tag("loops")
+                Text("MCP").tag("mcp")
+                Text("提示词").tag("prompts")
+                Text("用量").tag("usage")
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 360)
+            .frame(width: 560)
             .padding(.top, 12)
             .padding(.bottom, 4)
             switch pane {
             case "autoreply": AIAutoReplySettings()
-            case "loops": AILoopSettings()
+            case "loops", "loop": AILoopSettings()
+            case "mcp": AIMCPSettings()
+            case "prompts": AIPromptsSettings()
+            case "usage": AIUsageSettings()
             default: AIGeneralSettings()
             }
         }
         .task { await ai.reload() }
+        .onAppear { if pane == "loop" { pane = "loops" } }
     }
 }
 
 // MARK: - General
 
 private struct AIGeneralSettings: View {
+    @EnvironmentObject private var state: AppState
     @ObservedObject private var ai = AIState.shared
     @ObservedObject private var speech = Speech.shared
     @AppStorage("settingsTab") private var settingsTab = "general"
@@ -50,6 +58,16 @@ private struct AIGeneralSettings: View {
                 }
             } header: {
                 Text("模型")
+            }
+            Section {
+                capabilityPicker("看图模型", capability: "vision", empty: "默认（使用默认模型，需支持看图）",
+                                 hint: "用于解读图片附件", selection: $ai.settings.visionModel)
+                capabilityPicker("嵌入模型", capability: "embedding", empty: "不使用",
+                                 hint: "问问邮箱先全文检索，再按语义相似度重排（支持 OpenAI 兼容接口和 Gemini）", selection: $ai.settings.embeddingModel)
+            } header: {
+                Text("专用模型")
+            } footer: {
+                Text("只列出带「看图」或「嵌入」能力的模型；可以在 AI 服务 的模型列表中调整能力标签。").font(.caption).foregroundStyle(.secondary)
             }
             Section("写作") {
                 Picker("输出语言", selection: $ai.settings.language) {
@@ -72,6 +90,22 @@ private struct AIGeneralSettings: View {
                     Text("仅 VIP").tag("vip")
                 }
                 .disabled(!ai.settings.smartReminders)
+                VStack(alignment: .leading, spacing: 2) {
+                    Picker("新邮件通知", selection: $ai.settings.notifyMode) {
+                        Text("普通").tag("normal")
+                        Text("附上 AI 一句话摘要").tag("annotate")
+                        Text("只通知重要邮件").tag("important")
+                    }
+                    .disabled(!ai.settings.smartReminders)
+                    Text(notifyHint).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Picker("跟进提醒", selection: $ai.settings.followupDays) {
+                    Text("关闭").tag(0)
+                    ForEach([1, 2, 3, 5, 7, 14], id: \.self) { d in Text("发出 \(d) 天未收到回复时").tag(d) }
+                    if ![0, 1, 2, 3, 5, 7, 14].contains(ai.settings.followupDays) {
+                        Text("发出 \(ai.settings.followupDays) 天未收到回复时").tag(ai.settings.followupDays)
+                    }
+                }
                 Toggle("打开长邮件时自动生成摘要", isOn: $ai.settings.autoSummary)
                 Toggle("允许处理加密邮件", isOn: $ai.settings.allowEncrypted)
                 Picker("每次发送给 AI 的正文上限", selection: $ai.settings.maxBodyChars) {
@@ -87,7 +121,34 @@ private struct AIGeneralSettings: View {
             } header: {
                 Text("智能提醒与隐私")
             } footer: {
-                Text("分析结果出现在侧边栏「待处理」中，到时间由菜单栏助手提醒。默认不把加密邮件交给 AI。")
+                Text("分析结果出现在侧边栏「待处理」中，到时间由菜单栏助手提醒。默认不把加密邮件交给 AI。AI 还会提示疑似钓鱼和诈骗的邮件。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                if mailAccounts.isEmpty {
+                    Text("还没有邮箱账户").font(.callout).foregroundStyle(.secondary)
+                }
+                ForEach(mailAccounts) { acc in
+                    Picker(selection: policyBinding(acc.id)) {
+                        Text("启用").tag("on")
+                        Text("关闭").tag("off")
+                        Text("仅本地模型").tag("local_only")
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle().fill(Color(hex: acc.color)).frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(acc.displayLabel)
+                                if acc.displayLabel != acc.email {
+                                    Text(acc.email).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("账户 AI 策略")
+            } footer: {
+                Text("「关闭」的账户不会交给 AI（包括摘要、智能分析、自动回复、Loop、问问邮箱和 MCP）；「仅本地模型」只允许 Ollama、LM Studio 等本机模型处理。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("朗读") {
@@ -117,6 +178,46 @@ private struct AIGeneralSettings: View {
         .formStyle(.grouped)
         .onAppear { voices = Speech.voices }
         .onChange(of: ai.settings) { _, _ in ai.scheduleSaveSettings() }
+    }
+
+    private var mailAccounts: [Account] { state.accounts.filter { $0.kind != .web } }
+
+    private func policyBinding(_ accountId: String) -> Binding<String> {
+        Binding(get: { ai.settings.policy(for: accountId) }, set: { v in
+            if v == "on" {
+                ai.settings.accountPolicies.removeValue(forKey: accountId)
+            } else {
+                ai.settings.accountPolicies[accountId] = v
+            }
+        })
+    }
+
+    private var notifyHint: String {
+        switch ai.settings.notifyMode {
+        case "annotate": return "照常弹出通知，智能分析完成后在通知正文前加上「✨ 一句话摘要」。"
+        case "important": return "先等智能分析：高优先级、需要回复、VIP 或疑似诈骗的邮件才弹出通知（不在分析范围内的邮件照常通知）。"
+        default: return "新邮件到达时立即通知。"
+        }
+    }
+
+    /// Picker over models tagged with `capability` (all models when none is tagged).
+    private func capabilityPicker(_ title: String, capability: String, empty: String, hint: String,
+                                  selection: Binding<AIModelRef?>) -> some View {
+        let tagged = ai.capableModels(capability)
+        let options = tagged.isEmpty ? ai.modelOptions : tagged
+        return VStack(alignment: .leading, spacing: 2) {
+            Picker(title, selection: selection) {
+                Text(empty).tag(AIModelRef?.none)
+                ForEach(options) { o in
+                    Text(o.label).tag(AIModelRef?.some(o.ref))
+                }
+                if let cur = selection.wrappedValue, !options.contains(where: { $0.ref == cur }) {
+                    Text(ai.label(for: cur) + "（不可用）").tag(AIModelRef?.some(cur))
+                }
+            }
+            Text(tagged.isEmpty && !ai.modelOptions.isEmpty ? hint + "（还没有模型标记了这项能力）" : hint)
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     private func modelPicker(_ title: String, hint: String, selection: Binding<AIModelRef?>) -> some View {
@@ -161,7 +262,11 @@ private struct AIAutoReplySettings: View {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
                                 Text(r.name.isEmpty ? "未命名规则" : r.name)
-                                AIChip(text: r.mode == "send" ? "直接发送" : "生成草稿", color: r.mode == "send" ? .red : .blue)
+                                if r.isVacation {
+                                    AIChip(text: "休假回复", symbol: "sun.max", color: .teal)
+                                } else {
+                                    AIChip(text: r.mode == "send" ? "直接发送" : "生成草稿", color: r.mode == "send" ? .red : .blue)
+                                }
                             }
                             Text(summary(r)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
@@ -224,6 +329,12 @@ private struct AIAutoReplySettings: View {
     }
 
     private func summary(_ r: AIAutoReplyRule) -> String {
+        if r.isVacation {
+            let start = r.start.map { Fmt.short($0) } ?? "现在"
+            let end = r.end.map { Fmt.short($0) } ?? "不限"
+            let text = r.replyText.replacingOccurrences(of: "\n", with: " ")
+            return "\(start) – \(end) → \(text.isEmpty ? "（未填写回复内容）" : text)"
+        }
         var parts: [String] = []
         if !r.fromContains.isEmpty { parts.append("发件人含「\(r.fromContains)」") }
         if !r.subjectContains.isEmpty { parts.append("主题含「\(r.subjectContains)」") }
@@ -240,7 +351,17 @@ private struct AIAutoReplyEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(rule.id.isEmpty ? "新建自动回复规则" : "编辑自动回复规则").font(.headline)
+            HStack {
+                Text(rule.id.isEmpty ? "新建自动回复规则" : "编辑自动回复规则").font(.headline)
+                Spacer()
+                Picker("", selection: Binding(get: { rule.kind }, set: { setKind($0) })) {
+                    Text("AI 回复").tag("ai")
+                    Text("休假回复").tag("vacation")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 200)
+            }
             Form {
                 TextField("名称", text: $rule.name)
                 Picker("账户", selection: Binding(get: { rule.accountId ?? "" }, set: { rule.accountId = $0.isEmpty ? nil : $0 })) {
@@ -249,36 +370,107 @@ private struct AIAutoReplyEditor: View {
                 }
                 TextField("发件人包含", text: $rule.fromContains, prompt: Text("留空表示不限"))
                 TextField("主题包含", text: $rule.subjectContains, prompt: Text("留空表示不限"))
-                TextField("AI 判断（可选）", text: $rule.aiMatch, prompt: Text("例如：客户询问报价或交期"))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("如何回复")
-                    TextEditor(text: $rule.instruction)
-                        .font(.body)
-                        .frame(height: 80)
-                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.quaternary))
-                    Text("例如：感谢来信，说明我在休假，下周一回复；紧急事项请联系李四。").font(.caption).foregroundStyle(.secondary)
+                if rule.isVacation {
+                    vacationFields
+                } else {
+                    TextField("AI 判断（可选）", text: $rule.aiMatch, prompt: Text("例如：客户询问报价或交期"))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("如何回复")
+                        TextEditor(text: $rule.instruction)
+                            .font(.body)
+                            .frame(height: 80)
+                            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.quaternary))
+                        Text("例如：感谢来信，说明我在休假，下周一回复；紧急事项请联系李四。").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Picker("方式", selection: Binding(get: { rule.mode }, set: { setMode($0) })) {
+                        Text("生成草稿并通知我").tag("draft")
+                        Text("直接发送").tag("send")
+                    }
+                    .pickerStyle(.radioGroup)
                 }
-                Picker("方式", selection: Binding(get: { rule.mode }, set: { setMode($0) })) {
-                    Text("生成草稿并通知我").tag("draft")
-                    Text("直接发送").tag("send")
-                }
-                .pickerStyle(.radioGroup)
                 Stepper("每天最多 \(rule.maxPerDay) 封", value: $rule.maxPerDay, in: 1...200)
-                Stepper("同一发件人 \(rule.oncePerSenderHours) 小时内只回复一次", value: $rule.oncePerSenderHours, in: 1...720)
+                if !rule.isVacation {
+                    Stepper("同一发件人 \(rule.oncePerSenderHours) 小时内只回复一次", value: $rule.oncePerSenderHours, in: 1...720)
+                }
                 Toggle("启用", isOn: $rule.enabled)
             }
             .formStyle(.grouped)
             HStack {
                 Spacer()
                 Button("取消") { onDone(nil) }.keyboardShortcut(.cancelAction)
-                Button("保存") { onDone(rule) }
+                Button("保存") { onDone(finalized) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(rule.name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(!canSave)
             }
         }
         .padding(20)
         .frame(width: 560, height: 620)
+    }
+
+    /// Vacation rules always carry both dates (the pickers show defaults until touched).
+    private var finalized: AIAutoReplyRule {
+        var r = rule
+        if r.isVacation {
+            let now = Int64(Date().timeIntervalSince1970)
+            if r.start == nil { r.start = now }
+            if r.end == nil { r.end = (r.start ?? now) + 7 * 86400 }
+        }
+        return r
+    }
+
+    private var canSave: Bool {
+        guard !rule.name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        if rule.isVacation {
+            guard !rule.replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            if let s = rule.start, let e = rule.end, e <= s { return false }
+        }
+        return true
+    }
+
+    /// Vacation replies: fixed text, always sent directly, once per sender for the whole period.
+    @ViewBuilder
+    private var vacationFields: some View {
+        DatePicker("开始", selection: dateBinding(\.start, fallback: Date()))
+        DatePicker("结束", selection: dateBinding(\.end, fallback: Date().addingTimeInterval(7 * 86400)))
+        if let s = rule.start, let e = rule.end, e <= s {
+            Text("结束时间要晚于开始时间").font(.caption).foregroundStyle(.red)
+        }
+        VStack(alignment: .leading, spacing: 4) {
+            Text("回复内容")
+            TextEditor(text: $rule.replyText)
+                .font(.body)
+                .frame(height: 110)
+                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.quaternary))
+            Text("例如：您好，我 10 月 1 日至 10 月 7 日休假，期间无法及时回复邮件，回来后会尽快处理。紧急事项请联系李四（lisi@example.com）。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        Label("休假回复不调用 AI：主题为「自动回复：原主题」，在这段时间内直接发送（带 Auto-Submitted 信头），同一发件人只回复一次。",
+              systemImage: "info.circle")
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func dateBinding(_ key: WritableKeyPath<AIAutoReplyRule, Int64?>, fallback: Date) -> Binding<Date> {
+        Binding(get: {
+            rule[keyPath: key].map { Date(timeIntervalSince1970: TimeInterval($0)) } ?? fallback
+        }, set: { d in
+            rule[keyPath: key] = Int64(d.timeIntervalSince1970)
+        })
+    }
+
+    private func setKind(_ kind: String) {
+        rule.kind = kind
+        guard kind == "vacation" else { return }
+        let cal = Calendar.current
+        if rule.start == nil {
+            rule.start = Int64(cal.startOfDay(for: Date()).timeIntervalSince1970)
+        }
+        if rule.end == nil {
+            let start = Date(timeIntervalSince1970: TimeInterval(rule.start ?? Int64(Date().timeIntervalSince1970)))
+            let end = cal.date(byAdding: .day, value: 7, to: start) ?? start.addingTimeInterval(7 * 86400)
+            rule.end = Int64(end.timeIntervalSince1970)
+        }
+        if rule.name.isEmpty || rule.name == "新规则" { rule.name = "休假回复" }
     }
 
     /// "直接发送" asks for confirmation.

@@ -12,7 +12,8 @@ struct MessageListView: View {
             ForEach(state.messages) { m in
                 MessageRow(message: m, account: state.account(for: m), showAccount: showsAccount, density: state.settings.listDensity,
                            showSnippet: state.settings.showSnippets,
-                           insight: state.selectedMailbox == AIState.pendingMailbox ? ai.insightForList(m.id) : nil)
+                           insight: state.selectedMailbox == AIState.pendingMailbox ? ai.insightForList(m.id) : nil,
+                           followUp: state.selectedMailbox == AIState.pendingMailbox && ai.isFollowUp(m.id))
                     .tag(m.id)
                     .contextMenu { contextMenu(for: m) }
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -198,7 +199,7 @@ struct MessageListView: View {
             Divider()
         }
         if state.selectedMailbox == AIState.pendingMailbox {
-            Button("✨ 标为已处理") { Task { await ai.setDone(m.id, done: true) } }
+            Button(ai.isFollowUp(m.id) ? "✨ 不再跟进" : "✨ 标为已处理") { Task { await ai.setDone(m.id, done: true) } }
             Divider()
         }
         Button("回复") { state.reply(m.id, mode: .reply) }
@@ -282,6 +283,8 @@ struct MessageRow: View {
     let showSnippet: Bool
     /// Shown in the "✨ 待处理" list: deadline and AI one-liner.
     var insight: AIInsight? = nil
+    /// A sent message still waiting for a reply (pending list, §8.7).
+    var followUp = false
 
     private var unread: Bool { !message.flags.seen || message.threadUnread > 0 }
 
@@ -323,7 +326,13 @@ struct MessageRow: View {
                     .lineLimit(1)
                 if let insight {
                     HStack(spacing: 4) {
-                        if let d = insight.deadline {
+                        if let risk = insight.riskTitle {
+                            AIChip(text: risk, symbol: "exclamationmark.shield.fill", color: .red)
+                                .help(insight.riskReason)
+                        }
+                        if followUp {
+                            AIChip(text: "待跟进", symbol: "arrow.uturn.forward", color: .teal)
+                        } else if let d = insight.deadline {
                             AIChip(text: "截止 " + AIFmt.deadline(d), symbol: "clock", color: AIFmt.isOverdueSoon(d) ? .red : .blue)
                         } else if insight.needsReply {
                             AIChip(text: "需回复", symbol: "arrowshape.turn.up.left", color: .orange)

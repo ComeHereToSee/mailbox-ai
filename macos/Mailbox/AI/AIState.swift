@@ -22,6 +22,12 @@ final class AIState: ObservableObject {
     @Published var lastLoopId: String?
     /// Message ids for the "✨ AI 批量处理" sheet (non-empty = shown).
     @Published var batchIds: [Int64] = []
+    /// Prompt library (§8.8).
+    @Published var prompts: [AIPromptPreset] = []
+    /// MCP send / delete requests waiting for the user (§8.2), oldest first.
+    @Published var confirmations: [AIConfirmation] = []
+    /// Bumped on every `ai_confirm` event and decision so lists can refresh.
+    @Published var confirmEvents = 0
 
     struct JobProgress: Hashable {
         var done: Int
@@ -39,9 +45,53 @@ final class AIState: ObservableObject {
     func reload() async {
         async let s = try? api.aiSettings()
         async let p = try? api.aiProviders()
+        async let pr = try? api.aiPrompts()
         if let s = await s { settings = s }
         if let p = await p { providers = p }
+        if let pr = await pr { prompts = pr }
         await reloadReminders()
+    }
+
+    /// Saves settings right away (e.g. the MCP switch, whose page reloads right after).
+    func saveSettingsNow() async {
+        settingsTask?.cancel()
+        if let saved = try? await api.saveAISettings(settings) { settings = saved }
+    }
+
+    // MARK: Prompt library
+
+    func reloadPrompts() async {
+        if let p = try? await api.aiPrompts() { prompts = p }
+    }
+
+    /// Prompts of one scope ("compose" | "reader" | "batch"), in their saved order.
+    func promptList(scope: String) -> [AIPromptPreset] {
+        prompts.filter { $0.scope == scope }.sorted { a, b in
+            a.sort != b.sort ? a.sort < b.sort : a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+    }
+
+    // MARK: MCP confirmations
+
+    /// Replaces the queue with the engine's pending list (kept as is when the request fails).
+    func refreshConfirmations() async {
+        guard let list = try? await api.aiConfirmations() else { return }
+        let now = Int64(Date().timeIntervalSince1970)
+        confirmations = list.filter { $0.expiresAt == 0 || $0.expiresAt > now }.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// Allows / refuses a request; a 404 means it was already decided (helper notification) or expired.
+    func decide(_ c: AIConfirmation, approve: Bool) async {
+        confirmations.removeAll { $0.id == c.id }
+        do {
+            try await api.answerAIConfirmation(c.id, approve: approve)
+            AppState.shared.show(Toast(text: (approve ? "已允许：" : "已拒绝：") + (c.title.isEmpty ? "MCP 请求" : c.title)))
+        } catch let e as APIError where e.status == 404 {
+            // Decided elsewhere or timed out: nothing to do.
+        } catch {
+            AppState.shared.show(Toast(text: error.localizedDescription, isError: true))
+        }
+        confirmEvents += 1
     }
 
     func reloadReminders() async {
@@ -99,11 +149,17 @@ final class AIState: ObservableObject {
         reminders.first { $0.message.id == id }?.insight
     }
 
+    /// The pending entry is a sent message still waiting for a reply (§8.7).
+    func isFollowUp(_ id: Int64) -> Bool {
+        reminders.first { $0.message.id == id }?.isFollowUp ?? false
+    }
+
     // MARK: Models
 
     struct ModelOption: Hashable, Identifiable {
         var ref: AIModelRef
         var label: String
+        var capabilities: [String] = []
         var id: String { ref.key }
     }
 
@@ -111,9 +167,14 @@ final class AIState: ObservableObject {
     var modelOptions: [ModelOption] {
         providers.filter(\.enabled).flatMap { p in
             p.models.filter(\.enabled).map { m in
-                ModelOption(ref: AIModelRef(provider: p.id, model: m.id), label: "\(p.name) · \(m.name)")
+                ModelOption(ref: AIModelRef(provider: p.id, model: m.id), label: "\(p.name) · \(m.name)", capabilities: m.capabilities)
             }
         }
+    }
+
+    /// Models tagged with a capability ("vision", "embedding", …).
+    func capableModels(_ capability: String) -> [ModelOption] {
+        modelOptions.filter { $0.capabilities.contains(capability) }
     }
 
     func label(for ref: AIModelRef?) -> String {
@@ -143,6 +204,13 @@ final class AIState: ObservableObject {
         case let .aiAutoreply(_, ruleName, _, sent, subject):
             let what = sent ? "已自动回复" : "已生成回复草稿"
             AppState.shared.show(Toast(text: "✨ \(what)：\(subject.isEmpty ? ruleName : subject)"))
+        case let .aiConfirm(id, kind, title, detail):
+            if !confirmations.contains(where: { $0.id == id }) {
+                confirmations.append(AIConfirmation(id: id, kind: kind, title: title, detail: detail))
+            }
+            confirmEvents += 1
+            WindowRouter.shared.showConfirm()
+            Task { await refreshConfirmations() }
         default:
             break
         }
@@ -150,10 +218,16 @@ final class AIState: ObservableObject {
 
     // MARK: Navigation
 
-    /// Opens Settings on one of the AI tabs ("ai" or "ai_features").
-    static func openSettings(tab: String = "ai") {
+    /// Opens Settings on one of the AI tabs ("ai" or "ai_features"), optionally on an AI 功能 pane.
+    static func openSettings(tab: String = "ai", pane: String? = nil) {
         UserDefaults.standard.set(tab, forKey: "settingsTab")
+        if let pane { UserDefaults.standard.set(normalizedPane(pane), forKey: "aiFeaturesPane") }
         WindowRouter.shared.showSettings()
+    }
+
+    /// AI 功能 panes: general | autoreply | loops | mcp | prompts | usage ("loop" is accepted for "loops").
+    static func normalizedPane(_ pane: String) -> String {
+        pane == "loop" ? "loops" : pane
     }
 }
 

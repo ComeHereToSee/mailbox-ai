@@ -232,7 +232,7 @@ struct AIProviderRow: View {
                 if provider.isCLI {
                     Text("订阅 · 命令行").font(.caption2).foregroundStyle(.secondary)
                 } else if provider.hasKey {
-                    Text("已设置密钥").font(.caption2).foregroundStyle(.secondary)
+                    Text(provider.keyCount > 1 ? "已设置 \(provider.keyCount) 个密钥" : "已设置密钥").font(.caption2).foregroundStyle(.secondary)
                 } else if provider.custom {
                     Text("自定义").font(.caption2).foregroundStyle(.secondary)
                 }
@@ -360,14 +360,23 @@ struct AIProviderDetail: View {
 
     // MARK: Key / address
 
+    /// Keys in the field (comma / newline separated; the engine uses them in turn, §8.4).
+    private var typedKeyCount: Int {
+        apiKey.split(whereSeparator: { $0 == "," || $0 == "，" || $0.isNewline })
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .count
+    }
+
     private var keySection: some View {
-        Section("API 密钥") {
-            HStack(spacing: 6) {
+        Section {
+            HStack(alignment: .top, spacing: 6) {
                 Group {
                     if showKey {
-                        TextField("API Key", text: $apiKey, prompt: Text(p.hasKey ? "已保存（输入新密钥以替换）" : "sk-…"))
+                        TextField("API Key", text: $apiKey, prompt: Text(p.hasKey ? "已保存（输入新密钥以替换）" : "sk-…，多个 Key 用逗号或换行分隔"),
+                                  axis: .vertical)
+                            .lineLimit(1...4)
                     } else {
-                        SecureField("API Key", text: $apiKey, prompt: Text(p.hasKey ? "已保存（输入新密钥以替换）" : "sk-…"))
+                        SecureField("API Key", text: $apiKey, prompt: Text(p.hasKey ? "已保存（输入新密钥以替换）" : "sk-…，多个 Key 用逗号分隔"))
                     }
                 }
                 .onSubmit { saveKey() }
@@ -383,7 +392,8 @@ struct AIProviderDetail: View {
             }
             HStack(spacing: 10) {
                 if p.hasKey {
-                    Label("已保存，加密存储在本机", systemImage: "checkmark.seal.fill").foregroundStyle(.green).font(.caption)
+                    Label(p.keyCount > 1 ? "已保存 \(p.keyCount) 个 Key，轮流使用，加密存储在本机" : "已保存，加密存储在本机",
+                          systemImage: "checkmark.seal.fill").foregroundStyle(.green).font(.caption)
                     Button("删除密钥") {
                         Task {
                             if await model.save(id, apiKey: "") { keyMessage = "已删除密钥" }
@@ -402,10 +412,19 @@ struct AIProviderDetail: View {
                     Link("获取密钥", destination: url).font(.caption)
                 }
             }
+            if typedKeyCount > 1 {
+                Text("将保存 \(typedKeyCount) 个 Key").font(.caption).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("API 密钥")
+        } footer: {
+            Text("可以填多个 Key（英文逗号或换行分隔，点眼睛图标后可换行输入），每次请求轮流使用；遇到 401 / 403 / 429 时自动换下一个重试。")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
     private func saveKey() {
+        // Kept as typed (commas / newlines separate several keys); only the outer whitespace goes.
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
         Task {
@@ -569,6 +588,19 @@ struct AIProviderDetail: View {
         })
     }
 
+    private func capability(_ mid: String, _ cap: String) -> Binding<Bool> {
+        Binding(get: { p.models.first { $0.id == mid }?.capabilities.contains(cap) ?? false }, set: { on in
+            edit { v in
+                guard let i = v.models.firstIndex(where: { m in m.id == mid }) else { return }
+                var caps = v.models[i].capabilities.filter { c in c != cap }
+                if on { caps.append(cap) }
+                let known = AIModel.capabilityOrder.filter { c in caps.contains(c) }
+                let other = caps.filter { c in !AIModel.capabilityOrder.contains(c) }
+                v.models[i].capabilities = known + other
+            }
+        })
+    }
+
     private var modelsSection: some View {
         Section {
             if p.models.isEmpty {
@@ -587,7 +619,21 @@ struct AIProviderDetail: View {
                             }
                         }
                         .toggleStyle(.checkbox)
+                        AICapabilityChips(capabilities: m.capabilities)
                         Spacer()
+                        Menu {
+                            ForEach(AIModel.capabilityOrder, id: \.self) { c in
+                                Toggle(isOn: capability(m.id, c)) {
+                                    Label(AIModel.capabilityTitle(c), systemImage: AIModel.capabilitySymbol(c))
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "tag")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("设置模型能力（看图、推理、工具、嵌入）")
                         Button {
                             edit { v in v.models.removeAll { x in x.id == m.id } }
                         } label: {
@@ -619,7 +665,8 @@ struct AIProviderDetail: View {
                 .disabled(fetching)
             }
         } footer: {
-            Text("勾选的模型会出现在 AI 功能 的模型选择中。").font(.caption).foregroundStyle(.secondary)
+            Text("勾选的模型会出现在 AI 功能 的模型选择中。能力标签（看图、推理、工具、嵌入）按模型 ID 自动推断，可以点标签图标手动调整。")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -628,7 +675,9 @@ struct AIProviderDetail: View {
         guard !mid.isEmpty else { return }
         newModel = ""
         edit { v in
-            if !v.models.contains(where: { $0.id == mid }) { v.models.append(AIModel(id: mid)) }
+            if !v.models.contains(where: { $0.id == mid }) {
+                v.models.append(AIModel(id: mid, capabilities: AIModel.inferCapabilities(mid)))
+            }
         }
         if testModel.isEmpty { testModel = mid }
     }
@@ -645,6 +694,29 @@ struct AIProviderDetail: View {
                 fetchError = error.localizedDescription
             }
             fetching = false
+        }
+    }
+}
+
+/// Small capability tags of a model ("看图", "推理", "工具", "嵌入").
+struct AICapabilityChips: View {
+    let capabilities: [String]
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(AIModel.capabilityOrder.filter { capabilities.contains($0) }, id: \.self) { c in
+                AIChip(text: AIModel.capabilityTitle(c), symbol: AIModel.capabilitySymbol(c), color: Self.color(c))
+            }
+        }
+    }
+
+    static func color(_ c: String) -> Color {
+        switch c {
+        case "vision": return .green
+        case "reasoning": return .orange
+        case "tools": return .blue
+        case "embedding": return .pink
+        default: return .gray
         }
     }
 }
@@ -702,6 +774,7 @@ struct AIFetchedModelsSheet: View {
                         HStack {
                             Text(m.name)
                             if m.name != m.id { Text(m.id).font(.caption).foregroundStyle(.secondary) }
+                            AICapabilityChips(capabilities: m.capabilities)
                             Spacer()
                             if existing.contains(m.id) { Text("已添加").font(.caption).foregroundStyle(.secondary) }
                         }

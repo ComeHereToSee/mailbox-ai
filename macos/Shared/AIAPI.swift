@@ -91,6 +91,77 @@ extension APIClient {
     func saveAIAutoReplyRule(_ r: AIAutoReplyRule) async throws -> AIAutoReplyRule { try await post("/v1/ai/autoreply", r) }
     func deleteAIAutoReplyRule(_ id: String) async throws { try await send("DELETE", "/v1/ai/autoreply/\(id)") }
 
+    // MARK: §8.1 Calendar events
+
+    /// Events found in a message (cached by the engine; `force` re-extracts).
+    func aiExtractEvents(_ id: Int64, force: Bool = false) async throws -> [AIExtractedEvent] {
+        struct B: Encodable { var force: Bool }
+        struct R: Decodable {
+            var events: [AIExtractedEvent]
+            private enum CodingKeys: String, CodingKey { case events }
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                events = ((try? c.decodeIfPresent([Lossy<AIExtractedEvent>].self, forKey: .events)) ?? []).compactMap(\.value)
+            }
+        }
+        let r: R = try await post("/v1/ai/messages/\(id)/events", B(force: force))
+        return r.events
+    }
+
+    // MARK: §8.2 Built-in MCP server
+
+    func aiMCPInfo() async throws -> AIMCPInfo { try await get("/v1/ai/mcp") }
+    /// Replaces the MCP token; returns the new one.
+    func regenerateAIMCPToken() async throws -> String {
+        struct R: Decodable { var token: String }
+        let r: R = try await post("/v1/ai/mcp/token")
+        return r.token
+    }
+    /// Pending send / delete requests from MCP clients.
+    func aiConfirmations() async throws -> [AIConfirmation] {
+        let r: AIList<AIConfirmation> = try await get("/v1/ai/confirm")
+        return r.items
+    }
+    /// Allows or refuses a pending request (404 = already decided or expired).
+    func answerAIConfirmation(_ id: String, approve: Bool) async throws {
+        struct B: Encodable { var approve: Bool }
+        try await send("POST", "/v1/ai/confirm/\(id)", B(approve: approve))
+    }
+
+    // MARK: §8.3 External MCP servers
+
+    func aiMCPServers() async throws -> [AIMCPServer] {
+        let r: AIList<AIMCPServer> = try await get("/v1/ai/mcp-servers")
+        return r.items
+    }
+    /// Saves a server; returns it when the engine echoes it back (nil otherwise).
+    @discardableResult
+    func saveAIMCPServer(_ s: AIMCPServer) async throws -> AIMCPServer? {
+        let data = try await send("POST", "/v1/ai/mcp-servers", s)
+        guard let saved = try? JSON.decoder.decode(AIMCPServer.self, from: data), !saved.id.isEmpty else { return nil }
+        return saved
+    }
+    func deleteAIMCPServer(_ id: String) async throws { try await send("DELETE", "/v1/ai/mcp-servers/\(id)") }
+    func testAIMCPServer(_ id: String) async throws -> AIMCPTestResult { try await post("/v1/ai/mcp-servers/\(id)/test") }
+
+    // MARK: §8.4 Usage
+
+    func aiUsage(days: Int = 30) async throws -> AIUsageReport { try await get("/v1/ai/usage", query: ["days": String(days)]) }
+
+    // MARK: §8.8 Prompt library
+
+    func aiPrompts() async throws -> [AIPromptPreset] {
+        let r: AIList<AIPromptPreset> = try await get("/v1/ai/prompts")
+        return r.items
+    }
+    @discardableResult
+    func saveAIPrompt(_ p: AIPromptPreset) async throws -> AIPromptPreset? {
+        let data = try await send("POST", "/v1/ai/prompts", p)
+        guard let saved = try? JSON.decoder.decode(AIPromptPreset.self, from: data), !saved.id.isEmpty else { return nil }
+        return saved
+    }
+    func deleteAIPrompt(_ id: String) async throws { try await send("DELETE", "/v1/ai/prompts/\(id)") }
+
     // MARK: Demo
 
     /// Seeds insights, a finished Loop, a cached summary and `claude_code/default` (for `--demo`).
@@ -112,6 +183,8 @@ struct AIChatBody: Encodable {
     var model: AIModelRef?
     var system: String?
     var messages: [AIChatMessage]
+    /// Let the model call the enabled external MCP tools (§8.3).
+    var tools: Bool = false
 }
 
 struct AIComposeBody: Encodable {
@@ -134,4 +207,17 @@ struct AITranslateBody: Encodable {
 struct AIAskBody: Encodable {
     var question: String
     var mailbox: String?
+    var tools: Bool = false
+}
+
+/// `POST /v1/ai/messages/{id}/attachments/{aid}/explain`: `text` carries PDF text extracted with PDFKit.
+struct AIExplainBody: Encodable {
+    var text: String?
+    var question: String?
+}
+
+/// `POST /v1/ai/messages/{id}/prompt`: run a saved reader prompt on the message or its thread.
+struct AIPromptBody: Encodable {
+    var prompt: String
+    var thread: Bool
 }

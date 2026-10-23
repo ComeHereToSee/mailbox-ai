@@ -73,14 +73,17 @@ struct AIModel: Codable, Hashable, Identifiable {
     var name: String = ""
     var group: String = ""
     var enabled: Bool = true
+    /// "vision" | "reasoning" | "tools" | "embedding" (§8.4); inferred by the engine, editable in the UI.
+    var capabilities: [String] = []
 
-    private enum CodingKeys: String, CodingKey { case id, name, group, enabled }
+    private enum CodingKeys: String, CodingKey { case id, name, group, enabled, capabilities }
 
-    init(id: String, name: String = "", group: String = "", enabled: Bool = true) {
+    init(id: String, name: String = "", group: String = "", enabled: Bool = true, capabilities: [String] = []) {
         self.id = id
         self.name = name.isEmpty ? id : name
         self.group = group
         self.enabled = enabled
+        self.capabilities = capabilities
     }
 
     init(from decoder: Decoder) throws {
@@ -90,6 +93,47 @@ struct AIModel: Codable, Hashable, Identifiable {
         if name.isEmpty { name = id }
         group = c.lenient(String.self, .group, "")
         enabled = c.lenient(Bool.self, .enabled, true)
+        capabilities = c.lenient([String].self, .capabilities, [])
+    }
+
+    static let capabilityOrder = ["vision", "reasoning", "tools", "embedding"]
+
+    static func capabilityTitle(_ c: String) -> String {
+        switch c {
+        case "vision": return "看图"
+        case "reasoning": return "推理"
+        case "tools": return "工具"
+        case "embedding": return "嵌入"
+        default: return c
+        }
+    }
+
+    static func capabilitySymbol(_ c: String) -> String {
+        switch c {
+        case "vision": return "eye"
+        case "reasoning": return "brain"
+        case "tools": return "wrench.and.screwdriver"
+        case "embedding": return "point.3.connected.trianglepath.dotted"
+        default: return "tag"
+        }
+    }
+
+    func has(_ capability: String) -> Bool { capabilities.contains(capability) }
+
+    /// Same rules as the engine (docs/AI.md §8.4), used for models added by hand.
+    static func inferCapabilities(_ id: String) -> [String] {
+        let s = id.lowercased()
+        func hasAny(_ parts: [String]) -> Bool { parts.contains { s.contains($0) } }
+        if s.contains("embed") { return ["embedding"] }
+        var caps: [String] = []
+        if hasAny(["vision", "vl", "gpt-4o", "gpt-4.1", "gpt-5", "claude", "gemini", "glm-4v", "qwen-vl", "omni", "pixtral", "llava"]) {
+            caps.append("vision")
+        }
+        if hasAny(["reason", "r1", "o1", "o3", "o4", "thinking", "qwq"]) { caps.append("reasoning") }
+        if hasAny(["gpt", "claude", "gemini", "qwen", "deepseek-chat", "deepseek-v", "glm", "kimi", "moonshot", "mistral", "grok"]) {
+            caps.append("tools")
+        }
+        return caps
     }
 
     /// Group used when the engine left `group` empty: the part before the first "-" or "/".
@@ -110,8 +154,10 @@ struct AIProvider: Codable, Hashable, Identifiable {
     var models: [AIModel] = []
     var hasKey: Bool = false
     var custom: Bool = false
+    /// Number of keys stored (comma / newline separated, used in turn; output only, §8.4).
+    var keyCount: Int = 0
 
-    private enum CodingKeys: String, CodingKey { case id, kind, name, baseUrl, apiVersion, enabled, models, hasKey, custom }
+    private enum CodingKeys: String, CodingKey { case id, kind, name, baseUrl, apiVersion, enabled, models, hasKey, custom, keyCount }
 
     init() {}
 
@@ -126,6 +172,7 @@ struct AIProvider: Codable, Hashable, Identifiable {
         models = c.lenient([AIModel].self, .models, [])
         hasKey = c.lenient(Bool.self, .hasKey, false)
         custom = c.lenient(Bool.self, .custom, false)
+        keyCount = c.lenient(Int.self, .keyCount, hasKey ? 1 : 0)
     }
 
     var isCLI: Bool { kind.isCLI }
@@ -179,10 +226,24 @@ struct AISettings: Codable, Hashable {
     var maxBodyChars: Int = 12000
     var ttsVoice: String?
     var ttsRate: Double = 0.5
+    // §8 additions
+    /// Built-in MCP server (`/mcp`), off by default.
+    var mcpEnabled: Bool = false
+    /// Reads image attachments; nil = default model when it can see images.
+    var visionModel: AIModelRef?
+    /// Semantic re-ranking for "问问邮箱".
+    var embeddingModel: AIModelRef?
+    /// account id → "on" | "off" | "local_only" (missing = on).
+    var accountPolicies: [String: String] = [:]
+    /// "normal" | "annotate" | "important"
+    var notifyMode: String = "normal"
+    /// Remind about sent mail without a reply after this many days; 0 = off.
+    var followupDays: Int = 3
 
     private enum CodingKeys: String, CodingKey {
         case defaultModel, quickModel, language, tone, signatureName, smartReminders, smartScope, autoSummary
         case allowEncrypted, maxBodyChars, ttsVoice, ttsRate
+        case mcpEnabled, visionModel, embeddingModel, accountPolicies, notifyMode, followupDays
     }
 
     init() {}
@@ -201,7 +262,16 @@ struct AISettings: Codable, Hashable {
         maxBodyChars = c.lenient(Int.self, .maxBodyChars, 12000)
         ttsVoice = try? c.decodeIfPresent(String.self, forKey: .ttsVoice)
         ttsRate = c.lenient(Double.self, .ttsRate, 0.5)
+        mcpEnabled = c.lenient(Bool.self, .mcpEnabled, false)
+        visionModel = try? c.decodeIfPresent(AIModelRef.self, forKey: .visionModel)
+        embeddingModel = try? c.decodeIfPresent(AIModelRef.self, forKey: .embeddingModel)
+        accountPolicies = c.lenient([String: String].self, .accountPolicies, [:])
+        notifyMode = c.lenient(String.self, .notifyMode, "normal")
+        followupDays = c.lenient(Int.self, .followupDays, 3)
     }
+
+    /// "on" | "off" | "local_only" for an account.
+    func policy(for accountId: String) -> String { accountPolicies[accountId] ?? "on" }
 
     var isConfigured: Bool { defaultModel != nil || quickModel != nil }
 }
@@ -298,8 +368,12 @@ struct AIStreamLine: Decodable {
     var subject: String?
     var cached: Bool?
     var sources: [AISource]?
+    /// Tools called during a chat / ask with `tools: true` (§8.3).
+    var toolCalls: [AIToolCall]?
+    /// E.g. "Codex 暂不支持外部工具".
+    var toolsNote: String?
 
-    private enum CodingKeys: String, CodingKey { case delta, done, text, model, error, subject, cached, sources }
+    private enum CodingKeys: String, CodingKey { case delta, done, text, model, error, subject, cached, sources, toolCalls, toolsNote }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -311,6 +385,8 @@ struct AIStreamLine: Decodable {
         subject = try? c.decodeIfPresent(String.self, forKey: .subject)
         cached = try? c.decodeIfPresent(Bool.self, forKey: .cached)
         sources = try? c.decodeIfPresent([AISource].self, forKey: .sources)
+        toolCalls = (try? c.decodeIfPresent([Lossy<AIToolCall>].self, forKey: .toolCalls))?.compactMap(\.value)
+        toolsNote = try? c.decodeIfPresent(String.self, forKey: .toolsNote)
     }
 }
 
@@ -349,9 +425,15 @@ struct AIInsight: Codable, Hashable {
     var remindAt: Int64?
     var done: Bool = false
     var createdAt: Int64 = 0
+    /// Calendar events found during the analysis (§8.1).
+    var events: [AIExtractedEvent] = []
+    /// "phishing" | "scam" | nil (§8.7).
+    var risk: String?
+    var riskReason: String = ""
 
     private enum CodingKeys: String, CodingKey {
         case messageId, needsReply, priority, deadline, deadlineText, todos, oneLine, remindAt, done, createdAt
+        case events, risk, riskReason
     }
 
     init() {}
@@ -368,10 +450,23 @@ struct AIInsight: Codable, Hashable {
         remindAt = try? c.decodeIfPresent(Int64.self, forKey: .remindAt)
         done = c.lenient(Bool.self, .done, false)
         createdAt = c.lenient(Int64.self, .createdAt, 0)
+        events = (c.lenient([Lossy<AIExtractedEvent>].self, .events, [])).compactMap(\.value)
+        risk = (try? c.decodeIfPresent(String.self, forKey: .risk)).flatMap { $0.isEmpty ? nil : $0 }
+        riskReason = c.lenient(String.self, .riskReason, "")
     }
 
     /// Worth surfacing in the reader / pending list.
     var isActionable: Bool { needsReply || deadline != nil || !todos.isEmpty || priority == "high" }
+
+    /// "疑似钓鱼" / "疑似诈骗", or nil without a risk.
+    var riskTitle: String? {
+        guard let risk else { return nil }
+        switch risk {
+        case "phishing": return "疑似钓鱼"
+        case "scam": return "疑似诈骗"
+        default: return "存在风险"
+        }
+    }
 }
 
 /// `GET /v1/ai/reminders` entry.
@@ -379,16 +474,20 @@ struct AIReminderItem: Decodable, Hashable, Identifiable {
     var message: MessageSummary
     var accountLabel: String
     var insight: AIInsight
+    /// "insight" | "follow_up" (a sent message still waiting for a reply, §8.7).
+    var kind: String
 
     var id: Int64 { message.id }
+    var isFollowUp: Bool { kind == "follow_up" }
 
-    private enum CodingKeys: String, CodingKey { case message, accountLabel, insight }
+    private enum CodingKeys: String, CodingKey { case message, accountLabel, insight, kind }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         message = try c.decode(MessageSummary.self, forKey: .message)
         accountLabel = c.lenient(String.self, .accountLabel, "")
         insight = c.lenient(AIInsight.self, .insight, AIInsight())
+        kind = c.lenient(String.self, .kind, "insight")
     }
 }
 
@@ -595,11 +694,18 @@ struct AIAutoReplyRule: Codable, Hashable, Identifiable {
     var oncePerSenderHours: Int = 24
     var sentToday: Int = 0
     var day: String = ""
+    /// "ai" (default) | "vacation" (fixed `replyText` between `start` and `end`, §8.7).
+    var kind: String = "ai"
+    var replyText: String = ""
+    var start: Int64?
+    var end: Int64?
 
     private enum CodingKeys: String, CodingKey {
         case id, name, enabled, accountId, fromContains, subjectContains, aiMatch, instruction, mode, maxPerDay
-        case oncePerSenderHours, sentToday, day
+        case oncePerSenderHours, sentToday, day, kind, replyText, start, end
     }
+
+    var isVacation: Bool { kind == "vacation" }
 
     init() {}
 
@@ -618,5 +724,351 @@ struct AIAutoReplyRule: Codable, Hashable, Identifiable {
         oncePerSenderHours = c.lenient(Int.self, .oncePerSenderHours, 24)
         sentToday = c.lenient(Int.self, .sentToday, 0)
         day = c.lenient(String.self, .day, "")
+        kind = c.lenient(String.self, .kind, "ai")
+        replyText = c.lenient(String.self, .replyText, "")
+        start = try? c.decodeIfPresent(Int64.self, forKey: .start)
+        end = try? c.decodeIfPresent(Int64.self, forKey: .end)
+    }
+}
+
+// MARK: - §8 additions
+
+/// A JSON array, or an object wrapping one (`{"items": […]}`); malformed elements are skipped.
+struct AIList<T: Decodable>: Decodable {
+    var items: [T] = []
+
+    private struct AnyKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    init(from decoder: Decoder) throws {
+        if let list = try? decoder.singleValueContainer().decode([Lossy<T>].self) {
+            items = list.compactMap(\.value)
+            return
+        }
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        for key in c.allKeys {
+            if let list = try? c.decode([Lossy<T>].self, forKey: key) {
+                items = list.compactMap(\.value)
+                return
+            }
+        }
+    }
+}
+
+/// An event found in a message (`ExtractedEvent`, §8.1). Times are unix seconds.
+struct AIExtractedEvent: Codable, Hashable {
+    var title: String = ""
+    var start: Int64 = 0
+    /// nil = one hour.
+    var end: Int64?
+    var allDay: Bool = false
+    var location: String?
+    var notes: String = ""
+    /// How the message phrased it, e.g. "下周二下午 3 点".
+    var sourceText: String = ""
+
+    private enum CodingKeys: String, CodingKey { case title, start, end, allDay, location, notes, sourceText }
+
+    init(title: String, start: Int64, end: Int64?, allDay: Bool, location: String?, notes: String, sourceText: String) {
+        self.title = title
+        self.start = start
+        self.end = end
+        self.allDay = allDay
+        self.location = location
+        self.notes = notes
+        self.sourceText = sourceText
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = c.lenient(String.self, .title, "")
+        start = c.lenient(Int64.self, .start, 0)
+        end = try? c.decodeIfPresent(Int64.self, forKey: .end)
+        allDay = c.lenient(Bool.self, .allDay, false)
+        location = try? c.decodeIfPresent(String.self, forKey: .location)
+        notes = c.lenient(String.self, .notes, "")
+        sourceText = c.lenient(String.self, .sourceText, "")
+    }
+}
+
+/// A send / delete requested through MCP, waiting for the user (`Confirmation`, §8.2).
+struct AIConfirmation: Decodable, Hashable, Identifiable {
+    var id: String = ""
+    /// "send" | "delete"
+    var kind: String = "send"
+    var title: String = ""
+    var detail: String = ""
+    var draftId: String?
+    var messageIds: [Int64] = []
+    var createdAt: Int64 = 0
+    /// 0 when unknown (built from an `ai_confirm` event).
+    var expiresAt: Int64 = 0
+
+    private enum CodingKeys: String, CodingKey { case id, kind, title, detail, draftId, messageIds, createdAt, expiresAt }
+
+    init(id: String, kind: String, title: String, detail: String) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        createdAt = Int64(Date().timeIntervalSince1970)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id, "")
+        kind = c.lenient(String.self, .kind, "send")
+        title = c.lenient(String.self, .title, "")
+        detail = c.lenient(String.self, .detail, "")
+        draftId = try? c.decodeIfPresent(String.self, forKey: .draftId)
+        messageIds = c.lenient([Int64].self, .messageIds, [])
+        createdAt = c.lenient(Int64.self, .createdAt, 0)
+        expiresAt = c.lenient(Int64.self, .expiresAt, 0)
+    }
+
+    var isDelete: Bool { kind == "delete" }
+}
+
+/// `GET /v1/ai/mcp`.
+struct AIMCPInfo: Decodable, Hashable {
+    var enabled: Bool = false
+    var url: String = ""
+    var token: String = ""
+    /// Filled in by the Swift side (the core returns "").
+    var stdioCommand: String = ""
+
+    private enum CodingKeys: String, CodingKey { case enabled, url, token, stdioCommand }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = c.lenient(Bool.self, .enabled, false)
+        url = c.lenient(String.self, .url, "")
+        token = c.lenient(String.self, .token, "")
+        stdioCommand = c.lenient(String.self, .stdioCommand, "")
+    }
+}
+
+/// An external MCP server the assistant may call (`McpServerConfig`, §8.3).
+struct AIMCPServer: Codable, Hashable, Identifiable {
+    var id: String = ""
+    var name: String = ""
+    var enabled: Bool = true
+    /// "stdio" | "http"
+    var transport: String = "stdio"
+    var command: String = ""
+    var args: [String] = []
+    var env: [String: String] = [:]
+    var url: String = ""
+    var headers: [String: String] = [:]
+
+    private enum CodingKeys: String, CodingKey { case id, name, enabled, transport, command, args, env, url, headers }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id, "")
+        name = c.lenient(String.self, .name, "")
+        enabled = c.lenient(Bool.self, .enabled, true)
+        transport = c.lenient(String.self, .transport, "stdio")
+        command = c.lenient(String.self, .command, "")
+        args = c.lenient([String].self, .args, [])
+        env = c.lenient([String: String].self, .env, [:])
+        url = c.lenient(String.self, .url, "")
+        headers = c.lenient([String: String].self, .headers, [:])
+    }
+
+    var isHTTP: Bool { transport == "http" }
+}
+
+struct AIMCPToolInfo: Decodable, Hashable, Identifiable {
+    var name: String = ""
+    var description: String = ""
+
+    var id: String { name }
+
+    private enum CodingKeys: String, CodingKey { case name, description }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = c.lenient(String.self, .name, "")
+        description = c.lenient(String.self, .description, "")
+    }
+}
+
+/// `POST /v1/ai/mcp-servers/{id}/test`.
+struct AIMCPTestResult: Decodable, Hashable {
+    var ok: Bool = false
+    var tools: [AIMCPToolInfo] = []
+    var error: String?
+
+    private enum CodingKeys: String, CodingKey { case ok, tools, error }
+
+    init(ok: Bool, error: String?) {
+        self.ok = ok
+        self.error = error
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = c.lenient(Bool.self, .ok, false)
+        tools = (c.lenient([Lossy<AIMCPToolInfo>].self, .tools, [])).compactMap(\.value)
+        error = try? c.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+/// One tool call reported in a `done` line (`tool_calls`).
+struct AIToolCall: Decodable, Hashable {
+    var server: String = ""
+    var tool: String = ""
+    var ok: Bool = true
+
+    private enum CodingKeys: String, CodingKey { case server, tool, ok }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        server = c.lenient(String.self, .server, "")
+        tool = c.lenient(String.self, .tool, "")
+        ok = c.lenient(Bool.self, .ok, true)
+    }
+}
+
+/// `GET /v1/ai/usage` (§8.4).
+struct AIUsageReport: Decodable, Hashable {
+    struct Day: Decodable, Hashable, Identifiable {
+        /// "2026-10-23" (local date).
+        var date: String = ""
+        var calls: Int = 0
+        var inputTokens: Int = 0
+        var outputTokens: Int = 0
+        var errors: Int = 0
+
+        var id: String { date }
+
+        private enum CodingKeys: String, CodingKey { case date, calls, inputTokens, outputTokens, errors }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            date = c.lenient(String.self, .date, "")
+            calls = c.lenient(Int.self, .calls, 0)
+            inputTokens = c.lenient(Int.self, .inputTokens, 0)
+            outputTokens = c.lenient(Int.self, .outputTokens, 0)
+            errors = c.lenient(Int.self, .errors, 0)
+        }
+    }
+
+    struct ByModel: Decodable, Hashable, Identifiable {
+        var provider: String = ""
+        var model: String = ""
+        var calls: Int = 0
+        var inputTokens: Int = 0
+        var outputTokens: Int = 0
+
+        var id: String { provider + "/" + model }
+
+        private enum CodingKeys: String, CodingKey { case provider, model, calls, inputTokens, outputTokens }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            provider = c.lenient(String.self, .provider, "")
+            model = c.lenient(String.self, .model, "")
+            calls = c.lenient(Int.self, .calls, 0)
+            inputTokens = c.lenient(Int.self, .inputTokens, 0)
+            outputTokens = c.lenient(Int.self, .outputTokens, 0)
+        }
+    }
+
+    struct ByFeature: Decodable, Hashable, Identifiable {
+        var feature: String = ""
+        var calls: Int = 0
+        var inputTokens: Int = 0
+        var outputTokens: Int = 0
+
+        var id: String { feature }
+
+        private enum CodingKeys: String, CodingKey { case feature, calls, inputTokens, outputTokens }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            feature = c.lenient(String.self, .feature, "")
+            calls = c.lenient(Int.self, .calls, 0)
+            inputTokens = c.lenient(Int.self, .inputTokens, 0)
+            outputTokens = c.lenient(Int.self, .outputTokens, 0)
+        }
+    }
+
+    var days: [Day] = []
+    var byModel: [ByModel] = []
+    var byFeature: [ByFeature] = []
+
+    private enum CodingKeys: String, CodingKey { case days, byModel, byFeature }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        days = (c.lenient([Lossy<Day>].self, .days, [])).compactMap(\.value)
+        byModel = (c.lenient([Lossy<ByModel>].self, .byModel, [])).compactMap(\.value)
+        byFeature = (c.lenient([Lossy<ByFeature>].self, .byFeature, [])).compactMap(\.value)
+    }
+
+    static func featureTitle(_ f: String) -> String {
+        switch f {
+        case "compose": return "写信助手"
+        case "summary": return "摘要"
+        case "insight": return "智能分析"
+        case "batch": return "批量处理"
+        case "loop": return "Loop"
+        case "autoreply": return "自动回复"
+        case "ask": return "问问邮箱"
+        case "chat": return "对话"
+        case "events": return "日程提取"
+        case "explain": return "解读附件"
+        case "mcp": return "MCP"
+        case "embedding": return "嵌入"
+        case "test": return "检查连接"
+        case "translate": return "翻译"
+        case "replies": return "建议回复"
+        case "prompt": return "我的提示词"
+        default: return f
+        }
+    }
+}
+
+/// A saved prompt (`PromptPreset`, §8.8).
+struct AIPromptPreset: Codable, Hashable, Identifiable {
+    var id: String = ""
+    var name: String = ""
+    /// "compose" | "reader" | "batch"
+    var scope: String = "compose"
+    var prompt: String = ""
+    var sort: Int = 0
+
+    private enum CodingKeys: String, CodingKey { case id, name, scope, prompt, sort }
+
+    init(scope: String) {
+        self.scope = scope
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id, "")
+        name = c.lenient(String.self, .name, "")
+        scope = c.lenient(String.self, .scope, "compose")
+        prompt = c.lenient(String.self, .prompt, "")
+        sort = c.lenient(Int.self, .sort, 0)
+    }
+
+    static func scopeTitle(_ scope: String) -> String {
+        switch scope {
+        case "compose": return "写信"
+        case "reader": return "阅读"
+        case "batch": return "批量处理"
+        default: return scope
+        }
     }
 }

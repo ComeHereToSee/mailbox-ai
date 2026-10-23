@@ -411,8 +411,11 @@ final class AppState: ObservableObject {
         case .messagesChanged, .snoozed:
             scheduleReload()
             AIState.shared.scheduleRemindersReload()
-        case .aiInsight, .aiReminder, .aiJob, .aiLoop, .aiAutoreply:
+        case .aiInsight, .aiReminder, .aiJob, .aiLoop, .aiAutoreply, .aiConfirm:
             AIState.shared.handle(event)
+        case .aiNotify:
+            // Posted by the helper as a notification; the list refreshes through new_mail / messages_changed.
+            AIState.shared.scheduleRemindersReload()
         case .newMail:
             scheduleReload(delay: 100_000_000)
         case .foldersChanged:
@@ -471,10 +474,26 @@ final class AppState: ObservableObject {
             }
             compose(req)
         case "settings":
-            if let tab = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "tab" })?.value {
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            if let tab = items.first(where: { $0.name == "tab" })?.value {
                 UserDefaults.standard.set(tab, forKey: "settingsTab")
             }
+            // mailboxai://settings?tab=ai_features&pane=general|autoreply|loop|mcp|prompts|usage
+            if let pane = items.first(where: { $0.name == "pane" })?.value, !pane.isEmpty {
+                UserDefaults.standard.set(AIState.normalizedPane(pane), forKey: "aiFeaturesPane")
+            }
             WindowRouter.shared.showSettings()
+        case "confirm":
+            // From the helper's AI_CONFIRM notification: mailboxai://confirm/<id>
+            // (may arrive before bootstrap finished, so make sure the API is reachable first).
+            _ = await Daemon.ensureRunning(timeout: 10)
+            await AIState.shared.refreshConfirmations()
+            if AIState.shared.confirmations.isEmpty {
+                WindowRouter.shared.showMain()
+                show(Toast(text: "这个请求已经处理或已过期"))
+            } else {
+                WindowRouter.shared.showConfirm()
+            }
         case "add-account":
             WindowRouter.shared.showMain()
             showAddAccount = true

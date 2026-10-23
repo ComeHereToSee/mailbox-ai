@@ -42,6 +42,10 @@ struct MainView: View {
                 WindowRouter.shared.pendingAssistant = false
                 openWindow(id: "assistant")
             }
+            if WindowRouter.shared.pendingConfirm {
+                WindowRouter.shared.pendingConfirm = false
+                openWindow(id: "ai-confirm")
+            }
         }
         .onContinueUserActivity(CSSearchableItemActionType) { activity in
             if let id = SpotlightIndexer.messageId(from: activity) {

@@ -5,6 +5,8 @@ import UserNotifications
 final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
     private let center = UNUserNotificationCenter.current()
     private static let category = "NEW_MAIL"
+    /// MCP send / delete confirmations (docs/AI.md §8.2).
+    private static let confirmCategory = "AI_CONFIRM"
 
     func setup() {
         center.delegate = self
@@ -16,7 +18,11 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
                                                   textInputButtonTitle: "发送", textInputPlaceholder: "输入回复内容")
         let cat = UNNotificationCategory(identifier: Self.category, actions: [reply, read, archive, trash], intentIdentifiers: [],
                                          options: [.customDismissAction])
-        center.setNotificationCategories([cat])
+        let allow = UNNotificationAction(identifier: "AI_ALLOW", title: "允许", options: [.authenticationRequired])
+        let deny = UNNotificationAction(identifier: "AI_DENY", title: "拒绝", options: [])
+        let confirm = UNNotificationCategory(identifier: Self.confirmCategory, actions: [allow, deny], intentIdentifiers: [],
+                                             options: [.customDismissAction])
+        center.setNotificationCategories([cat, confirm])
     }
 
     func post(message: MessageSummary, accountLabel: String, sound: Bool) {
@@ -31,6 +37,47 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
         if message.isVip { content.interruptionLevel = .timeSensitive }
         let req = UNNotificationRequest(identifier: "mail-\(message.id)", content: content, trigger: nil)
         center.add(req)
+    }
+
+    /// Smart notifications (`ai_notify`): a new-mail notification (same identifier, category and quick actions).
+    func postMail(messageId: Int64, title: String, subtitle: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.subtitle = subtitle.isEmpty ? "（无主题）" : subtitle
+        content.body = body
+        content.categoryIdentifier = Self.category
+        content.userInfo = ["message_id": messageId]
+        content.sound = .default
+        center.add(UNNotificationRequest(identifier: "mail-\(messageId)", content: content, trigger: nil))
+    }
+
+    /// notify_mode "annotate": re-posts the still-delivered `mail-<id>` notification silently with "✨ one_line" first.
+    func annotate(messageId: Int64, oneLine: String) async {
+        let line = oneLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return }
+        let identifier = "mail-\(messageId)"
+        let delivered = await center.deliveredNotifications()
+        guard let note = delivered.first(where: { $0.request.identifier == identifier }),
+              let content = note.request.content.mutableCopy() as? UNMutableNotificationContent,
+              !content.body.hasPrefix("✨") else { return }
+        content.body = "✨ " + line + (content.body.isEmpty ? "" : "\n" + content.body)
+        content.sound = nil
+        content.interruptionLevel = .passive
+        try? await center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+    }
+
+    /// An MCP client wants to send / delete mail: 允许 / 拒绝 answer `POST /v1/ai/confirm/{id}`.
+    func postConfirm(id: String, kind: String, title: String, detail: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title.isEmpty ? (kind == "delete" ? "MCP 请求删除邮件" : "MCP 请求发送邮件") : title
+        content.subtitle = "需要你的确认（3 分钟内有效）"
+        content.body = String(detail.prefix(400))
+        content.categoryIdentifier = Self.confirmCategory
+        content.threadIdentifier = "ai-confirm"
+        content.userInfo = ["confirm_id": id]
+        content.sound = .default
+        content.interruptionLevel = .timeSensitive
+        center.add(UNNotificationRequest(identifier: "ai-confirm-\(id)", content: content, trigger: nil))
     }
 
     /// AI notifications (reminders, Loop results, auto-replies); a click opens `url` in the main app.
@@ -56,12 +103,34 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list, .sound])
+        if notification.request.content.interruptionLevel == .passive {
+            completionHandler([.list])
+        } else {
+            completionHandler([.banner, .list, .sound])
+        }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
+        if let confirmId = info["confirm_id"] as? String {
+            let action = response.actionIdentifier
+            Task {
+                switch action {
+                case "AI_ALLOW", "AI_DENY":
+                    // A 404 means the main app (or a timeout) decided first.
+                    try? await APIClient.shared.answerAIConfirmation(confirmId, approve: action == "AI_ALLOW")
+                case UNNotificationDismissActionIdentifier:
+                    break
+                default:
+                    if let url = URL(string: "mailboxai://confirm/\(confirmId)") {
+                        await MainActor.run { Daemon.openMainApp(url: url) }
+                    }
+                }
+                completionHandler()
+            }
+            return
+        }
         if let link = info["url"] as? String, let url = URL(string: link) {
             if response.actionIdentifier != UNNotificationDismissActionIdentifier {
                 DispatchQueue.main.async { Daemon.openMainApp(url: url) }

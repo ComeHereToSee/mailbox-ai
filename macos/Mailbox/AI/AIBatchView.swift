@@ -33,6 +33,7 @@ struct AIBatchSheet: View {
         Op(id: "todos", title: "提取待办", symbol: "checklist", hint: "列出每封邮件里的待办事项并汇总"),
         Op(id: "draft_replies", title: "生成回复草稿", symbol: "arrowshape.turn.up.left", hint: "为每封邮件写好回复，保存到草稿箱"),
         Op(id: "custom", title: "自定义指令", symbol: "wand.and.stars", hint: "对每封邮件执行你的指令"),
+        Op(id: "unsubscribe", title: "退订", symbol: "bell.slash", hint: "对带退订链接的邮件执行退订（不调用 AI）"),
     ]
 
     var body: some View {
@@ -57,7 +58,7 @@ struct AIBatchSheet: View {
             footer
         }
         .padding(20)
-        .frame(width: 720, height: jobId == nil ? 460 : 600)
+        .frame(width: 720, height: jobId == nil ? 530 : 600)
         .onChange(of: ai.jobProgress[jobId ?? ""]) { _, _ in
             Task { await refresh() }
         }
@@ -89,7 +90,12 @@ struct AIBatchSheet: View {
                 .buttonStyle(.plain)
             }
             if op == "custom" || op == "draft_replies" {
-                Text(op == "custom" ? "指令" : "回复要求（可选）").font(.headline).padding(.top, 4)
+                HStack {
+                    Text(op == "custom" ? "指令" : "回复要求（可选）").font(.headline)
+                    Spacer()
+                    if op == "custom" { promptMenu }
+                }
+                .padding(.top, 4)
                 TextField(op == "custom" ? "例如：提取每封邮件里的金额和付款截止日" : "例如：礼貌地确认收到，稍后详细回复",
                           text: $instruction, axis: .vertical)
                     .lineLimit(2...4)
@@ -97,6 +103,24 @@ struct AIBatchSheet: View {
             }
             Spacer(minLength: 0)
         }
+    }
+
+    /// Batch prompts from the prompt library (§8.8).
+    private var promptMenu: some View {
+        Menu {
+            ForEach(ai.promptList(scope: "batch")) { p in
+                Button(p.name) { instruction = p.prompt }
+            }
+            if !ai.promptList(scope: "batch").isEmpty { Divider() }
+            Button("管理提示词…") {
+                dismiss()
+                AIState.openSettings(tab: "ai_features", pane: "prompts")
+            }
+        } label: {
+            Label("我的提示词", systemImage: "text.book.closed")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
     }
 
     // MARK: Step 2
@@ -208,6 +232,13 @@ struct AIBatchSheet: View {
                 }
                 if let err = item.error {
                     Text(err).font(.callout).foregroundStyle(.red)
+                } else if let link = Self.browserLink(item.output) {
+                    // Unsubscribe that needs a browser: "需要在浏览器中打开：url".
+                    HStack(spacing: 6) {
+                        Text("需要在浏览器中打开").font(.callout)
+                        Link("打开退订页面", destination: link).font(.callout)
+                    }
+                    .help(link.absoluteString)
                 } else if !item.output.isEmpty {
                     MarkdownText(text: item.output)
                         .font(.callout)
@@ -235,6 +266,14 @@ struct AIBatchSheet: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
+    }
+
+    static func browserLink(_ output: String) -> URL? {
+        let prefixes = ["需要在浏览器中打开：", "需要在浏览器中打开:"]
+        guard let prefix = prefixes.first(where: { output.hasPrefix($0) }) else { return nil }
+        let rest = output.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: rest), let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        return url
     }
 
     // MARK: Footer
@@ -302,7 +341,7 @@ struct AIBatchSheet: View {
         if firstDone && j.op == "classify" {
             picked = Set(j.items.filter { !$0.suggested.isEmpty }.map(\.messageId))
         }
-        if firstDone && j.op == "draft_replies" {
+        if firstDone && (j.op == "draft_replies" || j.op == "unsubscribe") {
             state.scheduleReload()
         }
     }

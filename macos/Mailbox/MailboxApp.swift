@@ -27,6 +27,14 @@ struct MailboxApp: App {
         }
         .defaultSize(width: 820, height: 640)
 
+        // MCP send / delete confirmations (docs/AI.md §8.2).
+        Window("需要你的确认", id: "ai-confirm") {
+            AIConfirmWindow()
+                .environmentObject(state)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
         SwiftUI.Settings {
             SettingsView()
                 .environmentObject(state)
@@ -70,6 +78,19 @@ final class WindowRouter {
 
     /// Set when the assistant was requested before the main window captured `openWindow`.
     var pendingAssistant = false
+
+    /// Set when a confirmation arrived before the main window captured `openWindow`.
+    var pendingConfirm = false
+
+    /// Brings up the MCP confirmation window (AIState.confirmations).
+    func showConfirm() {
+        if let open = openWindow {
+            open(id: "ai-confirm")
+        } else {
+            pendingConfirm = true
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     /// Opens the "✨ AI 助手" window, optionally on a Loop's results.
     func showAssistant(loop: String? = nil) {

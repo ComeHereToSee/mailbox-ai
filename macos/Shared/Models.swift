@@ -721,6 +721,11 @@ enum MailEvent {
     case aiJob(jobId: String, done: Int, total: Int, status: String)
     case aiLoop(loopId: String, runId: String, name: String, status: String, preview: String)
     case aiAutoreply(messageId: Int64, ruleName: String, draftId: String?, sent: Bool, subject: String)
+    // AI §8.9
+    /// An MCP client asks to send / delete mail: answer with `POST /v1/ai/confirm/{id}`.
+    case aiConfirm(id: String, kind: String, title: String, detail: String)
+    /// Smart notifications (`notify_mode` "important"): the helper posts this instead of the new-mail notification.
+    case aiNotify(messageId: Int64, title: String, subtitle: String, body: String)
     case unknown
 
     private struct Envelope: Decodable {
@@ -767,6 +772,10 @@ enum MailEvent {
         var draftId: String?
         var sent: Bool?
         var subject: String?
+        var id: String?
+        var kind: String?
+        var detail: String?
+        var subtitle: String?
     }
 
     private static func decodeAI(_ type: String, _ data: Data) -> MailEvent {
@@ -783,6 +792,11 @@ enum MailEvent {
         case "ai_autoreply":
             return .aiAutoreply(messageId: e.messageId ?? 0, ruleName: e.ruleName ?? "", draftId: e.draftId, sent: e.sent ?? false,
                                 subject: e.subject ?? "")
+        case "ai_confirm":
+            guard let id = e.id, !id.isEmpty else { return .unknown }
+            return .aiConfirm(id: id, kind: e.kind ?? "send", title: e.title ?? "", detail: e.detail ?? "")
+        case "ai_notify":
+            return .aiNotify(messageId: e.messageId ?? 0, title: e.title ?? "", subtitle: e.subtitle ?? "", body: e.body ?? "")
         default:
             return .unknown
         }
@@ -815,7 +829,7 @@ enum MailEvent {
         case "settings_changed": return .settingsChanged
         case "snoozed": return .snoozed(messageId: env.messageId ?? 0)
         case "resync": return .resync
-        case "ai_insight", "ai_reminder", "ai_job", "ai_loop", "ai_autoreply": return decodeAI(env.type, data)
+        case "ai_insight", "ai_reminder", "ai_job", "ai_loop", "ai_autoreply", "ai_confirm", "ai_notify": return decodeAI(env.type, data)
         default: return .unknown
         }
     }

@@ -339,6 +339,7 @@ struct ComposeWindow: View {
         }
         .onDisappear {
             ai.stream.cancel()
+            ai.subjectStream.cancel()
             Task { await model.closeWithoutSending() }
         }
         .alert("无法发送", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
@@ -392,6 +393,7 @@ struct ComposeWindow: View {
                 TextField("", text: $model.draft.subject)
                     .textFieldStyle(.plain)
                     .onChange(of: model.draft.subject) { _, _ in model.markDirty() }
+                AISubjectIndicator(stream: ai.subjectStream)
                 if model.draft.priorityHigh {
                     Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red).help("重要")
                 }
