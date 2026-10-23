@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    # Docs-only changes don't need a build.
+    paths-ignore: ['docs/**', '**/*.md']
   pull_request:
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
 
 concurrency:
