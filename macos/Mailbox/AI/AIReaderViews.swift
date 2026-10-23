@@ -217,6 +217,7 @@ struct AIInsightChips: View {
                 }
                 if !i.oneLine.isEmpty {
                     Text(i.oneLine).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                        .layoutPriority(-1)
                         .help(i.oneLine)
                 }
                 Spacer(minLength: 4)
@@ -225,6 +226,7 @@ struct AIInsightChips: View {
                 }
                 .buttonStyle(.link)
                 .font(.caption)
+                .fixedSize()
             }
         }
     }

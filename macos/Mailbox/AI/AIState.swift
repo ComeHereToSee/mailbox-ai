@@ -526,5 +526,7 @@ struct AIChip: View {
         .padding(.vertical, 2)
         .foregroundStyle(color)
         .background(color.opacity(0.12), in: Capsule())
+        // Chips keep their full label; neighbouring text truncates instead.
+        .fixedSize()
     }
 }
