@@ -528,3 +528,253 @@ ai_autoreply  { message_id, rule_name, draft_id, sent, subject }
 - 默认模型设为 `claude_code/default`。
 
 这样 CI 截图时不需要真实的模型，也能看到 AI 卡片和待处理列表。
+
+## 8. 补充功能（A1–A3 剩余部分）
+
+本节是第二批功能的契约，规则与前文相同：JSON 用 snake_case，流式接口用 NDJSON，错误格式为 `{error, code}`。
+
+### 8.1 日程提取（A2）
+```rust
+pub struct ExtractedEvent {
+    pub title: String,
+    pub start: i64,              // unix 秒
+    pub end: Option<i64>,        // 缺省时由 UI 按 1 小时处理
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub notes: String,           // 一句话说明
+    pub source_text: String,     // 原文中的说法，例如「下周二下午 3 点」
+}
+```
+- **接口**：`POST /v1/ai/messages/{id}/events`（非流），返回 `{"events":[ExtractedEvent]}`。
+  - 用 `quick_model`，`json=true`。提示词要给出当前日期、星期和时区。
+  - 缓存在 kv `ai_events`（id 为 message_id）；请求体 `{force: bool}` 为 true 时重新提取。
+- **与智能分析合并**：`Insight` 新增 `events: Vec<ExtractedEvent>`（serde default）。智能分析时顺带提取日程，同时写入 `ai_events` 缓存。
+- **UI**：
+  - 阅读区 ✨ 菜单增加「提取日程到日历」，打开一个表格：每行可以修改标题和时间，点「加入日历」后用现有的 `CalendarService`（EventKit）写入日历。
+  - insight 标签增加「📅 日程 N」，点击打开同一个表格。
+
+### 8.2 内置邮箱 MCP 服务（A3）
+让 Claude Code、Codex、Cherry Studio 等 MCP 客户端直接操作邮箱。
+
+- **开关与令牌**：
+  - `AiSettings.mcp_enabled: bool`，默认 false。关闭时 `/mcp` 返回 HTTP 403，JSON-RPC 错误信息为「MCP 未启用：请在 设置 → AI 功能 → MCP 中开启」。
+  - MCP 使用单独的固定令牌：存在 secrets 中，键名 `ai:mcp_token`。第一次读取时自动生成（32 字节随机数，hex 编码），可以重新生成。
+  - `/mcp` 接受 `Authorization: Bearer <mcp_token>`，也接受原有的每次启动随机生成的 API token。
+- **传输**：Streamable HTTP，`POST /mcp`（与现有本地 API 在同一端口），只用 JSON 响应（`Content-Type: application/json`），不用 SSE。
+  - 请求是单个 JSON-RPC 2.0 对象。
+  - 通知类消息（没有 id）返回 HTTP 202，无响应体。
+  - `GET /mcp` 返回 405。
+- **支持的方法**：
+  - `initialize`：返回 `{protocolVersion, capabilities:{tools:{}}, serverInfo:{name:"mailbox-ai", version}, instructions}`。protocolVersion 回显客户端请求的版本（如果在支持列表 `["2025-06-18","2025-03-26","2024-11-05"]` 中），否则返回 `2025-06-18`。instructions 用中文简要说明可用工具和「发送 / 删除需要用户在 Mailbox AI 中确认」。
+  - `ping`
+  - `tools/list`
+  - `tools/call`：返回 `{content:[{type:"text",text}], isError}`。text 为易读的中文和 JSON 混排，列表用简洁的 JSON。
+- **工具**（name 与 inputSchema 都要写全，description 用中文）：
+
+  | 工具 | 参数 | 说明 |
+  |---|---|---|
+  | `list_accounts` | — | 账户列表：id、email、label |
+  | `search_emails` | `query`（搜索语法）, `mailbox?`, `limit?`（≤ 50，默认 20） | 返回 id、from、subject、date、snippet、unread、account |
+  | `list_unread` | `limit?` | 统一收件箱中的未读邮件 |
+  | `read_email` | `id` | 信头加正文纯文本（最多 20000 字）。遵守 `allow_encrypted` 和账户 AI 策略（见 8.6） |
+  | `read_thread` | `id` | 整个会话 |
+  | `get_pending` | — | `/v1/ai/reminders` 的内容 |
+  | `draft_email` | `to[]`, `cc[]?`, `subject`, `body`, `account?` | 生成本地草稿并同步到服务器 → `{draft_id}`，不需要确认 |
+  | `reply_email` | `id`, `body`, `reply_all?` | 生成回复草稿 → `{draft_id}` |
+  | `send_email` | `draft_id`，或者 `to[]` / `cc[]?` / `bcc[]?` / `subject` / `body` / `account?` | **需要用户确认**，见下文 |
+  | `mark_emails` | `ids[]`, `action`（read / unread / star / unstar / archive） | 不需要确认 |
+  | `delete_emails` | `ids[]` | **需要用户确认**，确认后移到废纸篓 |
+
+  body 是纯文本，转成 HTML 后发送：转义后按空行分段落，单个换行变成 `<br>`。
+- **用户确认**：
+  ```rust
+  pub struct Confirmation { pub id: String, pub kind: String /* "send" | "delete" */, pub title: String, pub detail: String,
+                            pub draft_id: Option<String>, pub message_ids: Vec<i64>, pub created_at: i64, pub expires_at: i64 }
+  ```
+  1. 工具调用先创建确认请求（send 先存为草稿），发事件 `ai_confirm {id, kind, title, detail}`，然后在 HTTP 请求里等待用户决定，最长 180 秒。
+  2. 用户通过 `POST /v1/ai/confirm/{id}`（`{approve: bool}`）做出决定。
+  3. 结果：
+     - **同意**：send 走正常发件箱，带撤销发送延迟，返回「已发送（N 秒内可在 Mailbox AI 中撤销）」；delete 执行移到废纸篓。
+     - **拒绝或超时**：返回 `isError: false`，文本为「用户拒绝了…（已保留草稿 draft_id）」或「等待确认超时…」。
+  4. `GET /v1/ai/confirm` 列出待确认的请求。
+- **其他接口**：
+  - `GET /v1/ai/mcp` → `{enabled, url:"http://127.0.0.1:<port>/mcp", token, stdio_command}`。
+    - `stdio_command` 由 Swift 端补全，核心返回空字符串。
+    - 这里的 port 是实际监听的端口。
+  - `POST /v1/ai/mcp/token`：重新生成令牌 → `{token}`。
+- **stdio 桥（Swift）**：`MailboxAIHelper --mcp` 不启动 GUI。
+  - 读取 `daemon.json` 中的端口，从 `GET /v1/ai/mcp`（用 daemon token）取得 mcp token。
+  - 从 stdin 逐行读取 JSON-RPC，转发给 `POST /mcp`，把响应写到 stdout，一行一个。通知类消息不输出。
+  - 如果引擎没有运行：先 `open -g -b com.comeheretosee.mailbox.ai.helper` 启动助手 App，等 daemon.json 可用后再转发。
+- **设置 → AI 功能 → MCP**：
+  - 「启用 MCP 服务」开关、URL、令牌（可复制、可重新生成）。
+  - 一键复制的配置片段：
+    - Claude Code：`claude mcp add --transport http mailbox-ai <url> --header "Authorization: Bearer <token>"`
+    - Codex：`~/.codex/config.toml` 的 stdio 配置（`[mcp_servers.mailbox-ai] command = "<helper 路径>" args = ["--mcp"]`）。
+    - Cherry Studio / 通用 JSON：streamableHttp 的 url 加 headers。
+  - 待确认列表。
+- **确认界面**：
+  - **主 App**：收到 `ai_confirm` 事件时弹出模态窗口，显示标题、详情（收件人、主题、正文前 500 字，或要删除的邮件列表），按钮「允许」「拒绝」。
+  - **助手 App**：同时发一条通知，带「允许」「拒绝」两个操作（category `AI_CONFIRM`）。主 App 没开时也能处理。
+  - 任意一方做出决定后，另一方忽略即可；重复提交返回 404，可以忽略。
+
+### 8.3 外部 MCP 工具（A3，应用调用外部工具）
+```rust
+pub struct McpServerConfig { pub id: String, pub name: String, pub enabled: bool,
+    pub transport: String /* "stdio" | "http" */, pub command: String, pub args: Vec<String>,
+    pub env: BTreeMap<String,String>, pub url: String, pub headers: BTreeMap<String,String> }
+```
+- **接口**：
+  - `GET` / `POST /v1/ai/mcp-servers`：列表 / 保存。
+  - `DELETE /v1/ai/mcp-servers/{id}`
+  - `POST /v1/ai/mcp-servers/{id}/test` → `{ok, tools:[{name, description}], error?}`
+- **客户端（`ai/mcp_client.rs`）**：
+  - **stdio**：启动子进程（PATH 处理同 cli.rs），JSON-RPC 按行收发，先 `initialize` 再发 `notifications/initialized`。
+  - **http**：POST JSON-RPC。响应可能是 JSON，也可能是 `text/event-stream`（取 data 中带相同 id 的那条）；保留 `Mcp-Session-Id` 头。
+  - 超时：单次调用 60 秒。
+  - 每次对话结束后关闭 stdio 子进程，不做常驻。
+- **使用位置**：AI 助手的对话。`POST /v1/ai/chat` 和 `/ask` 请求体新增 `tools: bool`（默认 false），为 true 且有启用的服务器时启用工具：
+  - **openai / azure / anthropic / gemini**：
+    - 把各服务器的工具转换为对应格式：
+      - OpenAI：`tools:[{type:"function",function:{name,description,parameters}}]`
+      - Anthropic：`tools:[{name,description,input_schema}]`
+      - Gemini：`tools:[{functionDeclarations:[…]}]`
+    - 工具名统一为 `<server>__<tool>`，只保留 `[A-Za-z0-9_-]`，最长 64 个字符。
+    - 以非流式方式循环调用：模型发起工具调用 → 执行 → 把结果作为 tool 消息回传，最多 8 轮。
+    - 最后的文本作为一条 delta 输出，再输出 done。
+  - **claude_code**：把启用的服务器写成临时 `--mcp-config` JSON，追加参数 `--allowedTools mcp__<server>`（每个服务器一个），`--max-turns` 改为 8。内置的读写文件和执行命令类工具仍然禁用。
+  - **codex**：不支持，忽略 tools 并在 done 里给出 `"tools_note":"Codex 暂不支持外部工具"`。
+  - done 行额外带 `"tool_calls":[{"server","tool","ok":bool}]`。
+- **UI**：
+  - 设置 → AI 功能 → MCP：在「外部工具」小节中增删改服务器，可以「测试」并列出工具。
+  - AI 助手输入框旁有「🔧 使用工具」开关；回答下方显示调用过的工具。
+
+### 8.4 服务商与模型（A1 细项）
+- **多 Key 轮流**：
+  - `api_key` 可以填多个，用英文逗号或换行分隔，原样存在 secrets 中。
+  - 每次请求轮流取下一个（每个服务商一个计数器）。
+  - 遇到 401 / 403 / 429 时换下一个 Key 重试一次。
+  - `AiProvider` 新增 `key_count: usize`（仅输出）。
+- **模型能力**：`AiModel` 新增 `capabilities: Vec<String>`，取值 `"vision" | "reasoning" | "tools" | "embedding"`，serde default 为空。
+  - 拉取模型和读取预设时按 id 自动推断（不区分大小写）：
+    - embedding：含 `embed`。
+    - vision：含 `vision`、`vl`、`gpt-4o`、`gpt-4.1`、`gpt-5`、`claude`、`gemini`、`glm-4v`、`qwen-vl`、`omni`、`pixtral`、`llava`。
+    - reasoning：含 `reason`、`r1`、`o1`、`o3`、`o4`、`thinking`、`qwq`。
+    - tools：非 embedding 的 gpt、claude、gemini、qwen、deepseek-chat、deepseek-v、glm、kimi、moonshot、mistral、grok。
+  - UI 中每个模型显示能力小标签，可以手动开关。
+- **专用模型**：`AiSettings` 新增 `vision_model: Option<ModelRef>`、`embedding_model: Option<ModelRef>`。
+  - 看图：用于解读图片附件（8.5）。为空时，如果 default_model 带 vision 能力就用它，否则报错「需要支持看图的模型：请在 AI 功能中设置看图模型」。
+  - 嵌入：用于问问邮箱的语义重排。设置后，`/ask` 先用全文检索取 30 封候选，再按「问题 / 主题 + 摘要片段」的余弦相似度取前 8 封。
+    - 支持 openai（`POST {base}/embeddings`）和 gemini（`:batchEmbedContents`）。
+    - 其他服务商不支持时，忽略设置，并在日志中提示。
+- **用量**：
+  - 每次 AI 调用记录一条：日期（本地时间）、服务商、模型、功能（compose / summary / insight / batch / loop / autoreply / ask / chat / events / explain / mcp / embedding / test）、输入和输出 token、耗时、成功与否。
+  - 按「日期 + 服务商 + 模型 + 功能」聚合后存进 kv `ai_usage`。
+  - 各服务商的 token 来源：
+    - **openai**：请求加 `stream_options:{include_usage:true}`。服务商因此返回 400 时，去掉这个字段重试，并记住该服务商不支持。
+    - **anthropic**：`message_start` 和 `message_delta` 中的 usage。
+    - **gemini**：`usageMetadata`。
+    - **claude**：result 行的 `usage`。
+    - **codex**：能取到就取，取不到记 0。
+  - `GET /v1/ai/usage?days=30` → `{"days":[{date,calls,input_tokens,output_tokens,errors}], "by_model":[{provider,model,calls,input_tokens,output_tokens}], "by_feature":[{feature,calls,input_tokens,output_tokens}]}`
+  - UI：AI 功能 → 用量，用 Swift Charts 画每日柱状图，下面附按模型和按功能的表格。
+- **生成主题**：`/compose` 新增 op `subject`，根据正文 `text` 生成一行主题（不超过 30 字），done 中的 `subject` 与 `text` 相同。
+  - UI：写信窗口 ✨ 菜单增加「生成主题」，结果直接填入主题栏；主题栏不为空时先确认是否覆盖。
+
+### 8.5 解读附件（A1）
+- **接口**：`POST /v1/ai/messages/{id}/attachments/{aid}/explain`（流），请求体 `{text?: String, question?: String}`。
+  - **图片**（image/*，≤ 10 MB）：用看图模型，把图片以 base64 内联发送：
+    - OpenAI：content parts，`image_url` 为 data URL。
+    - Anthropic：`{type:"image",source:{type:"base64",media_type,data}}`。
+    - Gemini：`inlineData`。
+    - 不支持看图的 CLI 服务商报错。
+  - **PDF**：使用请求体中的 `text`（Swift 端用 PDFKit 提取，最多 max_body_chars）。没有 text 时返回 400。
+  - **text/*、.csv、.md、.json**：核心自己解码。
+  - 其他类型返回 400「暂不支持解读这种附件」。
+- **提示词**：默认「概括这份附件的内容和关键信息，列出需要我注意或处理的事项」；有 question 时回答这个问题。
+- **UI**：附件条右键菜单和 ✨ 菜单增加「AI 解读附件」，结果显示在 AI 卡片中。
+
+### 8.6 账户级策略（隐私）
+- `AiSettings.account_policies: BTreeMap<String /* account_id */, String /* "on" | "off" | "local_only" */>`，缺省为 on。
+- **执行位置**：在加载邮件正文给 AI 的统一入口检查。这个检查对摘要、翻译、建议回复、智能分析、批量、Loop、自动回复、问问邮箱、MCP 的 `read_email` 和解读附件全部生效。
+  - **off**：拒绝，code `ai_refused`，信息「这个账户已关闭 AI」。后台任务（智能分析、自动回复、Loop）直接跳过，不报错。
+  - **local_only**：只有当所用模型的服务商是本地的才允许。本地指：服务商 id 为 `ollama` 或 `lmstudio`，或者 base_url 的主机是 localhost / 127.0.0.1 / ::1。否则拒绝，信息「这个账户只允许使用本地模型」。后台任务跳过。
+  - 问问邮箱和 Loop：候选邮件中属于 off 账户的直接剔除；属于 local_only 账户的，在模型不是本地时剔除。
+- **UI**：AI 功能 → 常规 中列出每个账户，用 Picker 选「启用 / 关闭 / 仅本地模型」。
+
+### 8.7 提醒与安全（A2 细项）
+- **通知方式**：`AiSettings.notify_mode: String`，可选 `"normal"`（默认，不变）、`"annotate"`、`"important"`。
+  - **annotate**：智能分析完成后，发事件 `ai_insight {message_id}`（已有）。助手 App 收到后，如果这封邮件的通知还在，就用同一个 identifier `mail-<id>` 重发一条无声通知，正文前加「✨ one_line」。
+  - **important**：符合 smart_scope 的新邮件先不弹通知（NewMail 事件中 `notify=false`），等智能分析完成后再决定：
+    - priority 为 high、或 needs_reply、或发件人是 VIP、或 risk 不为空时，发事件 `ai_notify {message_id, title, subtitle, body}`，由助手 App 弹出。
+      - title 与普通新邮件通知格式相同：`[账户标签] 发件人`。
+      - subtitle 为主题，body 为「✨ one_line」。
+    - 分析失败、模型未配置或 90 秒内没有结果时，按普通新邮件通知弹出（同样通过 `ai_notify` 事件）。
+    - 不在分析范围内的邮件照常通知。
+- **钓鱼和诈骗识别**：`Insight` 新增 `risk: Option<String>`（`"phishing"`、`"scam"`，没有风险时为 null）和 `risk_reason: String`。智能分析的提示词要求判断风险：冒充、索要密码 / 验证码 / 转账、可疑链接等。
+  - 阅读区：有 risk 时显示红色横幅「AI 提示：疑似钓鱼 / 诈骗：理由」。
+  - 待处理列表：显示红色标签。
+- **跟进提醒**：`AiSettings.followup_days: u32`，默认 3，0 表示关闭。
+  - **检查**：housekeeping 每小时检查一次自己最近 14 天发出的邮件（Sent 文件夹），同时满足以下条件时，用 `quick_model` 判断这封邮件是否在等对方回复（JSON `{"awaits_reply":bool,"reason":…}`），结果缓存在 kv `ai_followup`：
+    - 发出时间超过 followup_days 天。
+    - 同一会话里此后没有来自其他人的邮件。
+  - **提醒**：判断为 true 的邮件加入提醒列表。`GET /v1/ai/reminders` 的每一项新增 `kind: "insight" | "follow_up"`。follow_up 项中：
+    - `message` 是那封已发邮件。
+    - insight 的 one_line 为「N 天没收到 收件人 的回复」。
+    - 第一次加入时发 `ai_reminder` 事件。
+  - **完成**：可以标记为已处理；会话里收到新回复后自动移除。
+- **休假自动回复**：
+  - `AutoReplyRule` 新增字段：
+    - `kind: String`：`"ai"`（默认）或 `"vacation"`。
+    - `reply_text: String`
+    - `start: Option<i64>`
+    - `end: Option<i64>`
+  - kind 为 vacation 时：
+    - 不调用 AI，回复内容就是 reply_text，主题用「自动回复：原主题」。
+    - 只在 start 到 end 期间生效，并且总是直接发送（加 `Auto-Submitted: auto-replied` 信头）。
+    - 同一发件人在整个休假期间只回复一次。
+    - 跳过规则与 AI 自动回复相同。
+  - UI：自动回复规则编辑器顶部可以切换「AI 回复 / 休假回复」。
+- **批量退订**：`/batch` 的 op 新增 `unsubscribe`，不调用 AI。
+  - 对每封带 List-Unsubscribe 的邮件调用现有的退订逻辑，每封的 output 为「已退订」或「需要在浏览器中打开：url」。
+  - summary 为汇总。
+  - UI 中把退订放进批量操作选项。
+
+### 8.8 提示词库
+```rust
+pub struct PromptPreset { pub id: String, pub name: String, pub scope: String /* "compose" | "reader" | "batch" */, pub prompt: String, pub sort: i64 }
+```
+- **接口**：
+  - `GET` / `POST /v1/ai/prompts`：列表 / 保存。
+  - `DELETE /v1/ai/prompts/{id}`
+  - 第一次读取时生成默认提示词：
+    - compose：「改成适合发给客户的语气」「压缩到 100 字以内」。
+    - reader：「提取所有金额和日期」「用三句话向老板汇报这封邮件」。
+    - batch：「提取订单号和金额，输出表格」。
+- **阅读区自定义提示**：`POST /v1/ai/messages/{id}/prompt`（流），请求体 `{prompt, thread: bool}`，对邮件或会话执行该提示，结果显示在 AI 卡片中。
+- **UI**：
+  - 写信窗口 ✨ 菜单：「我的提示词」子菜单（compose 类）→ 执行 `/compose` 的 custom op。
+  - 阅读区 ✨ 菜单：「我的提示词」（reader 类）。
+  - 批量处理：自定义指令旁边可以选 batch 类提示词。
+  - 设置 → AI 功能：增加「提示词」分区，用来管理提示词。
+
+### 8.9 新增事件
+```
+ai_confirm   { id, kind, title, detail }
+ai_notify    { message_id, title, subtitle, body }
+```
+
+### 8.10 演示数据（`POST /v1/ai/demo` 补充）
+- **日程**：给一封邮件写入 events（例如张三「周末爬山？」→「周六 08:00 西山爬山」）。
+- **风险**：插入一封演示钓鱼邮件，并写入带 `risk:"phishing"` 的 insight。
+  - 发件人「Apple 支持 <security@apple-id-verify.demo>」，主题「您的 Apple ID 已被锁定，请立即验证」。
+  - 这封邮件插入演示账户的收件箱（可以复用 seed_demo 的插入逻辑）。
+- **跟进**：插入一封 5 天前自己发出、没有回复的邮件，并写入对应的 follow_up 提醒。
+- **其他**：
+  - 写入一个演示 MCP 外部服务器配置，设为未启用。
+  - 写入 7 天的演示用量。
+  - `mcp_enabled` 设为 true，以便截图展示 MCP 页面。
+- **测试**：tests/ai.rs 补充：
+  - MCP 服务端：initialize、tools/list、search_emails、send_email 确认的同意和超时两种情况（超时时间可以用环境变量缩短）。
+  - 外部 MCP 客户端：用 shell 脚本伪造 stdio 服务器，用 axum 伪造 http 服务器，并配合一个支持 tools 的假 OpenAI 服务器跑完整的工具循环。
+  - 其他：多 Key 轮流、账户策略、日程提取解析、跟进提醒判定、休假回复、用量聚合、模型能力推断。
