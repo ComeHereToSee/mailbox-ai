@@ -1,20 +1,51 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="Mailbox"></p>
+<p align="center"><img src="docs/icon.png" width="128" alt="Mailbox AI"></p>
 
-<h1 align="center">Mailbox</h1>
+<h1 align="center">Mailbox AI</h1>
 
-<p align="center">轻量、简洁的 macOS 聚合邮箱。Gmail、Outlook / Hotmail、QQ、Foxmail、163、126、iCloud、ProtonMail… 一个收件箱全部搞定。</p>
+<p align="center">带 AI 的轻量 macOS 聚合邮箱：Gmail、Outlook / Hotmail、QQ、Foxmail、163、126、iCloud、ProtonMail… 一个收件箱全部搞定，再加上润色、代读、自动回复、批量处理、Loop 和智能提醒。</p>
 
-> 这是**无 AI 版**。带 AI 功能（润色、摘要、自动回复、Loop、Claude Code / Codex 订阅接入等）的版本在 [ComeHereToSee/mailbox-ai](https://github.com/ComeHereToSee/mailbox-ai)。
+> 这是 **AI 版**。不需要 AI 的话，请用更轻的无 AI 版 [ComeHereToSee/mailbox](https://github.com/ComeHereToSee/mailbox)。两个版本可以同时安装，数据互不影响。
 
 ![主界面](docs/screenshots/main.png)
 
-| 写信 | 设置 | 添加账户 |
-|---|---|---|
-| ![写信](docs/screenshots/compose.png) | ![设置](docs/screenshots/settings.png) | ![添加账户](docs/screenshots/add-account.png) |
-
 <sub>截图由 CI 在 macOS 15 上用演示数据（`--demo`）自动拍摄。</sub>
 
-## 特点
+## AI 功能
+
+- **AI 服务接入（参考 Cherry Studio）**：
+  - 内置 22 个服务商：OpenAI、Anthropic、Gemini、DeepSeek、通义千问（阿里云百炼）、Kimi、智谱 GLM、硅基流动、豆包、腾讯混元、百度千帆、MiniMax、阶跃星辰、OpenRouter、Groq、Mistral、xAI、Azure OpenAI，以及本地的 Ollama 和 LM Studio。
+  - 每个服务商可以填 API Key 和 API 地址，可以拉取或手动添加模型，可以检查连接；也可以添加任意 OpenAI 兼容的自定义服务商。
+  - 写作和对话用「默认模型」，摘要、分类、提醒等后台任务用便宜的「快速模型」。
+- **直接用 Claude Code / Codex 订阅**：
+  - 在终端登录过 `claude` 或 `codex` 后，选择「Claude Code」或「Codex」服务商即可。不需要 API Key，费用算在你自己的订阅里。
+  - 调用时 AI 只能读到这次要处理的邮件内容，不能读写文件，也不能执行命令。
+- **写信**：
+  - ✨ 润色、更正式、更友好、更简洁、扩写、纠错、翻译。选中文字时只改写选中部分。
+  - 「帮我写」：说一句要求，生成整封邮件。
+  - 回复时的「一键回复」：比如输入「同意，下周二可以」，生成完整回复。
+- **代读**：
+  - 一键总结邮件或整个会话：一句话结论、要点和待办。打开长邮件时可以自动总结。
+  - 用系统语音朗读摘要或全文，也可以把邮件翻译成中文或英文。
+- **建议回复**：针对当前邮件给出 3 条回复建议，点一下就打开写好的回复。
+- **自动回复**：
+  - 按条件匹配邮件：发件人、主题，或用一句话描述，例如「客户询问报价」，由 AI 判断。
+  - 匹配后生成回复草稿并通知你，也可以设为直接发送。
+  - 会自动跳过 noreply、群发和其他自动回复，并限制每天的次数，避免回复循环。
+- **批量处理**：多选邮件后，可以一次性总结、分类打标签、提取待办、生成回复草稿，或执行自定义指令。分类建议先给你确认再执行。
+- **Loop（定时 AI 任务）**：按时自动处理一批邮件，比如每天早上 8 点总结未读、工作日傍晚检查待回复、每周汇总账单。结果会发通知，也可以投递到收件箱。
+- **智能提醒**：新邮件到达时，AI 判断是否需要回复、有没有截止日期和待办。
+  - 结果汇总在侧边栏的「✨ 待处理」。
+  - 快到截止时间时，会弹出带账户名的提醒。
+- **问问邮箱**：用自然语言提问，比如「上个月京东的账单多少钱？」。回答里会标出引用的邮件，点击就能打开。
+- **隐私**：
+  - API Key 加密保存在本机，不写入数据库。
+  - 每次只发送需要处理的邮件，正文有长度上限。
+  - 加密邮件默认不交给 AI。
+  - 想完全不出本机，可以用 Ollama 或 LM Studio。
+
+详细用法见 [AI 使用说明](docs/guides/ai.md)；接口见 [docs/AI.md](docs/AI.md)。
+
+## 邮件功能（与无 AI 版相同）
 
 - **原生又轻**：SwiftUI 界面 + Rust 核心。后台 Helper 常驻菜单栏负责收信，主窗口关掉也照常提醒。
 - **所有常见邮箱**：内置 33 个服务商预设；其他邮箱可按 MX / ISPDB / SRV 自动识别。支持 IMAP（含 IDLE 实时推送）、POP3 和 SMTP。
@@ -46,11 +77,11 @@
 
 ## 安装
 
-1. 在仓库的 Actions 页面（或 Releases）下载 `Mailbox.dmg`，把 Mailbox 拖进“应用程序”。
+1. 在仓库的 Actions 页面（或 Releases）下载 `MailboxAI.dmg`，把 MailboxAI 拖进“应用程序”。
 2. 应用没有开发者签名，第一次打开需要二选一：
-   - 在 Finder 里**右键 Mailbox → 打开**；
-   - 或者在终端执行 `xattr -dr com.apple.quarantine /Applications/Mailbox.app`。
-3. 首次启动后会出现 **Mailbox Helper** 的通知授权弹窗，请选择“允许”。
+   - 在 Finder 里**右键 MailboxAI → 打开**；
+   - 或者在终端执行 `xattr -dr com.apple.quarantine /Applications/MailboxAI.app`。
+3. 首次启动后会出现 **Mailbox AI Helper** 的通知授权弹窗，请选择“允许”。
 4. 想登录时自动在后台收信：设置 → 通用 → “登录时在后台启动”。
 
 各邮箱的登录方法见 [docs/guides](docs/guides/)：
@@ -71,7 +102,7 @@
 
 ```bash
 brew install xcodegen
-scripts/build-macos.sh          # 生成 dist/Mailbox.dmg
+scripts/build-macos.sh          # 生成 dist/MailboxAI.dmg
 # 只构建本机架构，速度更快：
 ARCHS=arm64 scripts/build-macos.sh
 ```
@@ -79,8 +110,8 @@ ARCHS=arm64 scripts/build-macos.sh
 ## 架构
 
 ```
-Mailbox.app（SwiftUI）  ──HTTP/WebSocket（127.0.0.1 + token）──┐
-Contents/Library/LoginItems/MailboxHelper.app                    │
+MailboxAI.app（SwiftUI）  ──HTTP/WebSocket（127.0.0.1 + token）──┐
+Contents/Library/LoginItems/MailboxAIHelper.app                    │
    ├─ 菜单栏迷你收件箱、系统通知                                  │
    └─ libmailcore.a（Rust）◀──────────────────────────────────────┘
         ├─ IMAP / POP3 / SMTP / OAuth2 / 自动发现
