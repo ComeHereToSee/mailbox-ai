@@ -284,6 +284,8 @@ struct AIProviderDetail: View {
             Section { header }
             if p.isCLI {
                 cliSection
+            } else if p.id == "apple" {
+                AppleModelStatusSection()
             } else {
                 keySection
                 addressSection

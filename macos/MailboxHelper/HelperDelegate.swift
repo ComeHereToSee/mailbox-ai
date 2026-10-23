@@ -21,6 +21,8 @@ final class HelperDelegate: NSObject, NSApplicationDelegate {
             let event = MailEvent.decode(data)
             DispatchQueue.main.async { self?.handle(event) }
         }
+        // Apple's on-device model as a local OpenAI-compatible endpoint (macOS 26+ only).
+        AppleModelServer.shared.start()
         if !EngineHost.shared.start() {
             statusItem.showError(EngineHost.shared.lastError ?? "邮件引擎启动失败")
             return

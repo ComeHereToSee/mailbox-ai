@@ -24,6 +24,18 @@
     "description": "使用本机已登录的 codex 命令行，走你的 ChatGPT 订阅，不需要 API Key。"
   },
   {
+    "id": "apple",
+    "kind": "openai",
+    "name": "Apple 端侧模型",
+    "base_url": "http://127.0.0.1:47922/v1",
+    "website": "https://www.apple.com/apple-intelligence/",
+    "key_url": null,
+    "needs_key": false,
+    "color": "#1D1D1F",
+    "models": ["apple-on-device"],
+    "description": "macOS 26 的 Apple Intelligence 端侧模型：免费、不联网，由 Mailbox AI 助手在本机提供。适合摘要、分类和短邮件改写；长邮件会被截断。需要支持 Apple Intelligence 的 Mac，并在系统设置中打开 Apple Intelligence。"
+  },
+  {
     "id": "openai",
     "kind": "openai",
     "name": "OpenAI",

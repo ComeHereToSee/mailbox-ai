@@ -51,6 +51,9 @@ jobs:
       - name: Tools
         run: |
           brew install xcodegen
+          # Newest installed Xcode 26 (macOS 26 SDK → Apple on-device model support); falls back to the default.
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X"; fi
           xcodebuild -version
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build app and DMG
