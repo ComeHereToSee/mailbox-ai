@@ -70,9 +70,6 @@ jobs:
           open "mailboxai://settings?tab=general"
           sleep 5
           screencapture -x /tmp/shots/3-settings.png || true
-          open "mailboxai://add-account"
-          sleep 5
-          screencapture -x /tmp/shots/4-add-account.png || true
           open "mailboxai://settings?tab=crypto"
           sleep 5
           screencapture -x /tmp/shots/5-crypto.png || true
@@ -92,6 +89,10 @@ jobs:
           open "mailboxai://pending"
           sleep 5
           screencapture -x /tmp/shots/10-pending.png || true
+          # Last: the add-account sheet stays open on the main window.
+          open "mailboxai://add-account"
+          sleep 5
+          screencapture -x /tmp/shots/4-add-account.png || true
           tail -30 /tmp/app.log || true
           tail -30 "$HOME/Library/Application Support/Mailbox AI/logs/mailcore.log" || true
       - name: Upload screenshots
