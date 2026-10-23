@@ -6,7 +6,11 @@
 
 > 这是 **AI 版**。不需要 AI 的话，请用更轻的无 AI 版 [ComeHereToSee/mailbox](https://github.com/ComeHereToSee/mailbox)。两个版本可以同时安装，数据互不影响。
 
-![主界面](docs/screenshots/main.png)
+![主界面：AI 会话摘要与智能提醒](docs/screenshots/main.png)
+
+| AI 服务（Cherry Studio 风格） | AI 功能 | ✨ 待处理 | AI 助手 |
+|---|---|---|---|
+| ![AI 服务](docs/screenshots/ai-providers.png) | ![AI 功能](docs/screenshots/ai-features.png) | ![待处理](docs/screenshots/pending.png) | ![AI 助手](docs/screenshots/assistant.png) |
 
 <sub>截图由 CI 在 macOS 15 上用演示数据（`--demo`）自动拍摄。</sub>
 
